@@ -12,6 +12,10 @@ no hardware:
 - a single long stall, or a steady drip of skips past
   EPISODE_SKIP_FAULT_BUDGET, is a FAULT: the loop aborts the episode through
   fatal_error instead of executing a degraded plan,
+- starvation lag (empty queue; server still computing) never skips or
+  faults, even when a fresh chunk lands mid-stall,
+- a send that never returns faults within the per-send timeout instead of
+  parking the loop and its watchdog,
 - an instance-level ``robot.send_action`` override (test stubs, dry-run
   wrappers) is still honored — the async path must never bypass it.
 
@@ -53,6 +57,8 @@ class _FakeRobot:
         self.send_delay_s: float = 0.0
         # One-shot extra delays: send index -> seconds (consumed on use).
         self.stall_at: dict[int, float] = {}
+        # Send indices that hang forever (a wedged CAN write).
+        self.hang_at: set[int] = set()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
@@ -62,6 +68,8 @@ class _FakeRobot:
         return self._loop
 
     async def send_action_async(self, action: dict) -> dict:
+        if len(self.async_sent) in self.hang_at:
+            await asyncio.sleep(3600.0)
         extra = self.stall_at.pop(len(self.async_sent), 0.0)
         if self.send_delay_s or extra:
             await asyncio.sleep(self.send_delay_s + extra)
@@ -238,6 +246,92 @@ def test_sustained_deficit_faults_via_budget() -> None:
         assert client._episode_skipped_actions > client.EPISODE_SKIP_FAULT_BUDGET
         assert len(robot.async_sent) < n // 2, (
             "loop must fault early, not grind through the episode"
+        )
+    finally:
+        robot.close()
+
+
+def test_exact_bound_skip_is_allowed_not_faulted() -> None:
+    """n_stale == MAX_CATCHUP_TICKS is the largest PERMITTED skip.
+
+    A ~5.5-tick stall leaves exactly 3 overdue actions after the schedule's
+    ~2-tick slack: the loop must skip 3 and continue — faulting here would
+    be an off-by-one on the bound.
+    """
+    fps, n = 50.0, 40
+    robot = _FakeRobot(_JOINT_KEYS)
+    robot.stall_at[10] = 5.5 / fps
+    try:
+        client = _build_client(fps, robot)
+        _fill_queue(client, n, len(_JOINT_KEYS))
+
+        def drained() -> bool:
+            return len(robot.async_sent) + client._episode_skipped_actions >= n
+
+        _run_episode(client, robot, drained, timeout_s=5.0)
+        assert client._episode_skipped_actions == client.MAX_CATCHUP_TICKS, (
+            f"expected exactly {client.MAX_CATCHUP_TICKS} skips, got "
+            f"{client._episode_skipped_actions}"
+        )
+        assert client.fatal_error is None
+    finally:
+        robot.close()
+
+
+def test_starvation_stall_never_skips_or_faults() -> None:
+    """Lag accrued on an EMPTY queue is starvation, not lateness.
+
+    The loop idles waiting for the first chunk; the robot's event loop then
+    stalls for ~8 ticks and the chunk lands MID-stall (the receiver-thread
+    race). On wake the queue is non-empty and the wall clock is far behind —
+    but nothing was ever due, so the loop must re-anchor and execute the
+    whole chunk: no skips, no fault.
+    """
+    fps, n = 50.0, 20
+    robot = _FakeRobot(_JOINT_KEYS)
+    try:
+        client = _build_client(fps, robot)  # queue deliberately empty
+        thread = threading.Thread(
+            target=client.control_loop, args=("test",), daemon=True
+        )
+        thread.start()
+        time.sleep(5.0 / fps)  # let the loop idle on schedule
+        robot.event_loop.call_soon_threadsafe(time.sleep, 8.0 / fps)
+        time.sleep(2.0 / fps)  # mid-stall: the chunk arrives
+        _fill_queue(client, n, len(_JOINT_KEYS))
+        start = time.perf_counter()
+        while len(robot.async_sent) < n and time.perf_counter() - start < 5.0:
+            time.sleep(0.005)
+        client.shutdown_event.set()
+        thread.join(timeout=5.0)
+        assert client.fatal_error is None, f"starvation faulted: {client.fatal_error!r}"
+        assert client._episode_skipped_actions == 0, (
+            f"starvation skipped {client._episode_skipped_actions} actions"
+        )
+        assert len(robot.async_sent) == n
+    finally:
+        robot.close()
+
+
+def test_wedged_send_faults_within_timeout() -> None:
+    """A send that never returns must fault via the per-send timeout —
+    never park the loop (and with it the rate watchdog) indefinitely."""
+    fps, n = 100.0, 10
+    robot = _FakeRobot(_JOINT_KEYS)
+    robot.hang_at.add(3)
+    try:
+        client = _build_client(fps, robot)
+        _fill_queue(client, n, len(_JOINT_KEYS))
+        elapsed = _run_episode(
+            client,
+            robot,
+            drained=lambda: client.fatal_error is not None,
+            timeout_s=10.0,
+            expect_fault=True,
+        )
+        assert "wedged" in str(client.fatal_error)
+        assert elapsed < client._send_timeout_s + 2.0, (
+            f"fault took {elapsed:.1f}s — timeout not enforced"
         )
     finally:
         robot.close()
