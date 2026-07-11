@@ -23,7 +23,7 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 ### Testing
 
-- No automated test suite exists in this repository. Validate changes by importing the package and exercising the `Sim`-based code paths.
+- Hardware-free tests live in `tests/` (self-contained, e.g. `python tests/test_run_policy_control_loop.py`; they also collect under pytest). Beyond them, validate changes by importing the package and exercising the `Sim`-based code paths.
 
 ### Dependency extras
 

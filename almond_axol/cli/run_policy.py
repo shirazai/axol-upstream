@@ -22,6 +22,7 @@ when no key has been pressed.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import socket
 import threading
@@ -66,6 +67,18 @@ def _default_robot_config() -> AxolRobotConfig:
     run-policy streams no headset video, so the GPU-resident gst pipeline's
     encoded branch would be pure waste here. Teleop and collect-data default
     to the gst path; pass ``--robot_config.video_backend gst`` to opt in.
+
+    ``telemetry_hz=0``: the background telemetry pollers (16 motors at the
+    default demand rate is on the order of 2k CAN transactions/s) contend on
+    the same robot event loop every action send must transit, and measurably
+    drag the achieved control rate far below the configured fps. During an
+    episode the control loop issues ``motion_control`` on every tick that
+    has an action queued, and those feedback frames keep the position cache
+    fresh (the ``telemetry_hz=0`` contract in config_axol.py, same as
+    collect-data); on queue-dry ticks and between episodes no command goes
+    out, but an uncommanded arm holds position — the cache is stale but
+    static. Override with ``--robot_config.telemetry_hz`` if a session
+    genuinely needs background polling.
     """
     return AxolRobotConfig(
         cameras={
@@ -74,6 +87,7 @@ def _default_robot_config() -> AxolRobotConfig:
             "right_arm": ZedCameraConfig(serial=0),
         },
         video_backend="sdk",
+        telemetry_hz=0.0,
     )
 
 
@@ -452,6 +466,19 @@ def _build_axol_robot_client(
         EMA + trapezoidal-filtered in ``collect_data``.
         """
 
+        # Wall-clock catch-up bounds for the hot loop. A transient stall (a
+        # GC pause, a CAN retry) is absorbed by skipping up to
+        # MAX_CATCHUP_TICKS overdue actions — a hop of a few per-tick deltas,
+        # small by construction and step-guarded at the robot layer. Falling
+        # further behind in ONE event, or accumulating more than
+        # EPISODE_SKIP_FAULT_BUDGET skips over an episode (a steady drip of
+        # small skips is a systematic deficit, not jitter), means the loop
+        # cannot hold the configured fps: that is a fault — the episode is
+        # aborted through the same fatal_error path as a CAN error, rather
+        # than executing a degraded plan on the robot.
+        MAX_CATCHUP_TICKS = 3
+        EPISODE_SKIP_FAULT_BUDGET = 30
+
         def __init__(  # type: ignore[no-untyped-def]
             self,
             config,
@@ -488,6 +515,15 @@ def _build_axol_robot_client(
             self._publisher = publisher
             self._aggregate_strategy = aggregate_strategy
             self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
+            # Per-send bound for the async hot path, mirroring the
+            # synchronous wrapper's ``.result(timeout=5.0 if is_cartesian
+            # else 1.0)`` — without it a blocked send would suspend both the
+            # loop and its rate watchdog.
+            self._send_timeout_s = (
+                5.0
+                if any(not key.endswith(".pos") for key in robot.action_features)
+                else 1.0
+            )
             # ``(origin, packed_actions, timestamp)`` per chunk, sorted
             # oldest-first. ``packed_actions`` is a (chunk_size, action_dim)
             # tensor so aggregation runs as one batched op.
@@ -525,6 +561,9 @@ def _build_axol_robot_client(
             self.action_queue = Queue()
             self.action_queue_lock = _threading.Lock()
             self.action_queue_size = []
+            # Actions dropped by wall-clock catch-up (see _skip_stale_actions);
+            # ~0 on a healthy loop, reported in the per-episode stats line.
+            self._episode_skipped_actions: int = 0
             # Receiver + control + observation threads sync at episode start.
             self.start_barrier = _threading.Barrier(3)
             self.fps_tracker = FPSTracker(target_fps=self.config.fps)
@@ -537,6 +576,7 @@ def _build_axol_robot_client(
                 self.action_queue = Queue()
                 self.action_queue_size = []
                 self._chunk_buffer = []
+            self._episode_skipped_actions = 0
             with self.latest_action_lock:
                 self.latest_action = -1
             self.action_chunk_size = -1
@@ -713,8 +753,8 @@ def _build_axol_robot_client(
                 return self._temporal_ensemble_aggregate(incoming_actions)
             return super()._aggregate_action_queues(incoming_actions, aggregate_fn)
 
-        def control_loop_action(self, verbose: bool = False):  # type: ignore[no-untyped-def]
-            """Pop the next action, advance ``latest_action``, send to robot.
+        def _pop_next_action(self):  # type: ignore[no-untyped-def]
+            """Pop the next action and advance ``latest_action`` atomically.
 
             ``latest_action`` is updated inside the queue lock so the
             aggregator can never see a stale value and re-insert a
@@ -737,18 +777,108 @@ def _build_axol_robot_client(
                 key: action_tensor[i].item()
                 for i, key in enumerate(self.robot.action_features)
             }
-            performed = self.robot.send_action(action)
+            return timed_action, action, qs_after
 
+        def _finish_action(self, timed_action, performed, qs_after, verbose):  # type: ignore[no-untyped-def]
             if verbose:
                 self.logger.debug(
                     f"Ts={timed_action.get_timestamp()} | "
                     f"Action #{timed_action.get_timestep()} performed | "
                     f"Queue size: {qs_after}"
                 )
-
             if self._publisher is not None and performed is not None:
                 self._publisher.publish(performed)
             return performed
+
+        def control_loop_action(self, verbose: bool = False):  # type: ignore[no-untyped-def]
+            """Pop the next action and send it via the synchronous robot API.
+
+            Kept for API compatibility; the episode hot loop uses
+            :meth:`control_loop_action_async` instead — the synchronous
+            ``robot.send_action`` here pays a cross-thread hop onto the
+            robot's event loop per call.
+            """
+            timed_action, action, qs_after = self._pop_next_action()
+            performed = self.robot.send_action(action)
+            return self._finish_action(timed_action, performed, qs_after, verbose)
+
+        async def control_loop_action_async(self, verbose: bool = False):  # type: ignore[no-untyped-def]
+            """Event-loop-native action send.
+
+            Runs on the robot's event loop, so ``motion_control`` is awaited
+            inline with no cross-thread ``.result()`` block. The per-send
+            timeout the synchronous ``robot.send_action`` wrapper enforced
+            (``.result(timeout=...)``) is kept via ``wait_for``: a wedged
+            CAN send must become a fault, not park this coroutine — and
+            with it the rate watchdog, which only measures while the loop
+            runs. An *instance-level* ``robot.send_action`` override (test
+            stubs, dry-run wrappers) still wins: such a patch must hold no
+            matter which path executes actions. The override is called
+            synchronously on the event loop, so it must not block.
+            """
+            timed_action, action, qs_after = self._pop_next_action()
+            send_override = self.robot.__dict__.get("send_action")
+            if send_override is not None:
+                performed = send_override(action)
+            else:
+                try:
+                    performed = await asyncio.wait_for(
+                        self.robot.send_action_async(action), self._send_timeout_s
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"send_action_async exceeded {self._send_timeout_s:.1f}s "
+                        "— the send path is wedged; aborting the episode."
+                    ) from None
+            return self._finish_action(timed_action, performed, qs_after, verbose)
+
+        def _skip_stale_actions(self, n: int) -> int:
+            """Drop up to ``n`` overdue actions to hold wall-clock time.
+
+            Called by the hot loop when it falls one tick or more behind.
+            Action chunks are timestep-indexed with no time base of their
+            own, so a late loop must skip the actions it missed — otherwise
+            the whole trajectory replays late and, if the lag is sustained,
+            in slow motion. Popping advances ``latest_action`` exactly like
+            an executed action, so aggregation stays consistent.
+            """
+            skipped = 0
+            with self.action_queue_lock:
+                for _ in range(n):
+                    if self.action_queue.empty():
+                        break
+                    timed_action = self.action_queue.get_nowait()
+                    with self.latest_action_lock:
+                        self.latest_action = timed_action.get_timestep()
+                    skipped += 1
+            if skipped:
+                self.logger.debug(
+                    "Wall-clock catch-up: skipped %d stale action(s).", skipped
+                )
+            return skipped
+
+        def log_episode_stats(self) -> None:
+            """One queue-health line per episode.
+
+            ``queue depth min=0`` means the robot ran out of actions
+            (stop–start motion); ``skipped > 0`` means the loop missed
+            wall-clock ticks and the trajectory hopped forward instead of
+            slowing down — sustained skipping means the loop can't hold fps.
+            """
+            with self.action_queue_lock:
+                depths = list(self.action_queue_size)
+            if not depths and not self._episode_skipped_actions:
+                return
+            depth_part = (
+                f"queue depth min={min(depths)} mean={sum(depths) / len(depths):.1f}"
+                if depths
+                else "queue depth n/a"
+            )
+            self.logger.info(
+                "Episode stats: %s | skipped=%d (loop overruns)",
+                depth_part,
+                self._episode_skipped_actions,
+            )
 
         def control_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def,override]
             """Action-only control loop; obs send is on ``observation_loop``.
@@ -758,16 +888,26 @@ def _build_axol_robot_client(
             Axol. Decoupling restores the target rate. Unhandled
             exceptions (typically CAN faults from ``send_action``) are
             captured in ``self.fatal_error`` and trigger shutdown.
+
+            The per-step hot path runs as one coroutine *on the robot's
+            event loop* (collect-data's proven pattern, see
+            ``AxolRobot.event_loop``): awaiting ``send_action_async`` inline
+            removes the per-step cross-thread
+            ``run_coroutine_threadsafe(...).result()`` hop inside the
+            synchronous ``robot.send_action``, which caps the achieved rate
+            far below the configured fps once the event loop has any other
+            load. This thread only supervises the coroutine.
             """
             self.start_barrier.wait()
-            self.logger.info("Action-only control loop starting (obs send decoupled)")
+            self.logger.info(
+                "Action-only control loop starting "
+                "(hot loop on robot event loop; obs send decoupled)"
+            )
             try:
-                while self.running:
-                    control_loop_start = time.perf_counter()
-                    if self.actions_available():
-                        self.control_loop_action(verbose)
-                    elapsed = time.perf_counter() - control_loop_start
-                    time.sleep(max(0.0, self.config.environment_dt - elapsed))
+                future = asyncio.run_coroutine_threadsafe(
+                    self._control_loop_async(verbose), self.robot.event_loop
+                )
+                future.result()
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(
                     f"Control loop hit an unhandled exception ({exc!r}); "
@@ -775,6 +915,86 @@ def _build_axol_robot_client(
                 )
                 self.fatal_error = exc
                 self.shutdown_event.set()
+
+        async def _control_loop_async(self, verbose: bool = False) -> None:
+            """The 1/fps hot loop, on the robot's event loop.
+
+            Absolute-deadline pacing (mirrors collect-data's episode loop):
+            late wakeups are corrected on the next cycle instead of
+            stretching the command interval. Falling behind is handled in
+            three tiers:
+
+            - under one tick: absorbed by the deadline schedule;
+            - up to ``MAX_CATCHUP_TICKS``: the overdue actions are *skipped*
+              (see ``_skip_stale_actions``) and the schedule resynced — a
+              transient degrades to a small, bounded hop forward on the
+              planned trajectory, never to slow-motion replay. Skips are
+              counted per episode and reported in the episode stats line; a
+              healthy loop skips ~0;
+            - beyond that in one event, or past
+              ``EPISODE_SKIP_FAULT_BUDGET`` cumulative skips: the loop
+              cannot hold the configured fps. Raised as a fault into the
+              supervising thread (``fatal_error``, same path as a CAN
+              error) so the episode tears down and the robot holds,
+              instead of executing a degraded plan.
+
+            Starvation never faults: lag that accrued while the queue was
+            empty (server still computing the next chunk) is not lateness —
+            there was nothing to be late *for* — so it only re-anchors the
+            deadline. Attribution uses the PREVIOUS tick's availability, not
+            just the wake-time queue state: a fresh chunk landing mid-stall
+            must not convert a starvation stall into skips or a fault (the
+            arrival would otherwise race this check).
+            """
+            dt = self.config.environment_dt
+            deadline = time.perf_counter()
+            # False at episode start: the wait for the first chunk is
+            # starvation by definition.
+            had_actions_last_tick = False
+            while self.running:
+                deadline += dt
+                behind = time.perf_counter() - deadline
+                if behind >= dt:
+                    n_stale = int(behind / dt)
+                    with self.action_queue_lock:
+                        queue_empty = self.action_queue.empty()
+                    if queue_empty or not had_actions_last_tick:
+                        # Nothing was due while the lag accrued; re-anchor
+                        # the schedule (a deadline left behind would
+                        # burst-fire commands once actions arrive).
+                        deadline += n_stale * dt
+                    elif n_stale > self.MAX_CATCHUP_TICKS:
+                        raise RuntimeError(
+                            f"control loop fell {n_stale} ticks behind the "
+                            f"wall clock (catch-up bound: "
+                            f"{self.MAX_CATCHUP_TICKS}) — it cannot hold "
+                            f"{1.0 / dt:.0f} Hz; aborting the episode. Check "
+                            "CPU/CAN load on the robot host, telemetry_hz, "
+                            "and the configured fps."
+                        )
+                    else:
+                        self._episode_skipped_actions += self._skip_stale_actions(
+                            n_stale
+                        )
+                        deadline += n_stale * dt
+                        if (
+                            self._episode_skipped_actions
+                            > self.EPISODE_SKIP_FAULT_BUDGET
+                        ):
+                            raise RuntimeError(
+                                f"control loop skipped "
+                                f"{self._episode_skipped_actions} actions this "
+                                f"episode (budget: "
+                                f"{self.EPISODE_SKIP_FAULT_BUDGET}) — a "
+                                f"systematic rate deficit, not jitter; "
+                                "aborting the episode. Check CPU/CAN load on "
+                                "the robot host, telemetry_hz, and the "
+                                "configured fps."
+                            )
+                had_actions_last_tick = self.actions_available()
+                if had_actions_last_tick:
+                    await self.control_loop_action_async(verbose)
+                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
 
         def observation_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def]
             """Dedicated thread: capture and send observations.
@@ -1155,6 +1375,7 @@ def _run(
             control_thread.join(timeout=5.0)
             receiver_thread.join(timeout=5.0)
             obs_thread.join(timeout=5.0)
+            client.log_episode_stats()
 
             if interrupted or stop_event.is_set():
                 if dataset is not None:
