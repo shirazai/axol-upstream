@@ -20,8 +20,8 @@ from almond_axol.policy import (
     PolicyServer,
     PolicySpec,
     policy_url,
+    protocol,
 )
-from almond_axol.policy import protocol
 
 STATE = tuple(f"joint_{i}.pos" for i in range(4))
 ACTIONS = tuple(f"joint_{i}.pos" for i in range(4))
@@ -222,16 +222,18 @@ class ServerClientTest(unittest.TestCase):
         )
 
     def test_plain_function_policy(self) -> None:
-        with _Served(lambda obs: np.zeros((2, 4))) as served:
-            with PolicyClient(served.url) as client:
-                client.connect(_spec())
-                chunk = client.infer(
-                    state=[0.0] * 4,
-                    images={"overhead": _frame()},
-                    task="t",
-                    timestep=0,
-                    timestamp=0.0,
-                )
+        with (
+            _Served(lambda obs: np.zeros((2, 4))) as served,
+            PolicyClient(served.url) as client,
+        ):
+            client.connect(_spec())
+            chunk = client.infer(
+                state=[0.0] * 4,
+                images={"overhead": _frame()},
+                task="t",
+                timestep=0,
+                timestamp=0.0,
+            )
         self.assertEqual(chunk.shape, (2, 4))
 
     def test_infer_exception_is_relayed(self) -> None:
@@ -250,17 +252,19 @@ class ServerClientTest(unittest.TestCase):
                 )
 
     def test_wrong_width_chunk_is_relayed(self) -> None:
-        with _Served(lambda obs: np.zeros((2, 3))) as served:
-            with PolicyClient(served.url) as client:
-                client.connect(_spec())
-                with self.assertRaisesRegex(PolicyRemoteError, r"\(T, 4\)"):
-                    client.infer(
-                        state=[0.0] * 4,
-                        images={"overhead": _frame()},
-                        task="t",
-                        timestep=0,
-                        timestamp=0.0,
-                    )
+        with (
+            _Served(lambda obs: np.zeros((2, 3))) as served,
+            PolicyClient(served.url) as client,
+        ):
+            client.connect(_spec())
+            with self.assertRaisesRegex(PolicyRemoteError, r"\(T, 4\)"):
+                client.infer(
+                    state=[0.0] * 4,
+                    images={"overhead": _frame()},
+                    task="t",
+                    timestep=0,
+                    timestamp=0.0,
+                )
 
     def test_setup_can_refuse_the_session(self) -> None:
         class Picky(Policy):
@@ -268,9 +272,12 @@ class ServerClientTest(unittest.TestCase):
                 if "wrist" not in spec.camera_names:
                     raise ValueError("needs a wrist camera")
 
-        with _Served(Picky()) as served, PolicyClient(served.url) as client:
-            with self.assertRaisesRegex(PolicyRemoteError, "needs a wrist camera"):
-                client.connect(_spec())
+        with (
+            _Served(Picky()) as served,
+            PolicyClient(served.url) as client,
+            self.assertRaisesRegex(PolicyRemoteError, "needs a wrist camera"),
+        ):
+            client.connect(_spec())
 
     def test_declared_action_names_are_reported(self) -> None:
         class Cartesian(Policy):
@@ -283,14 +290,47 @@ class ServerClientTest(unittest.TestCase):
         self.assertEqual(ready.fps, 15)
 
     def test_second_robot_is_refused(self) -> None:
-        with _Served(_Recorder()) as served:
-            with PolicyClient(served.url) as first:
-                first.connect(_spec())
-                with PolicyClient(served.url) as second:
-                    with self.assertRaisesRegex(
-                        PolicyRemoteError, "already has a robot"
-                    ):
-                        second.connect(_spec())
+        with _Served(_Recorder()) as served, PolicyClient(served.url) as first:
+            first.connect(_spec())
+            with (
+                PolicyClient(served.url) as second,
+                self.assertRaisesRegex(PolicyRemoteError, "already has a robot"),
+            ):
+                second.connect(_spec())
+
+    def test_refusal_received_before_hello_send_is_reported(self) -> None:
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        ws = mock.Mock()
+        ws.send.side_effect = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+        ws.recv.return_value = protocol.encode_error(
+            "Policy server already has a robot connected."
+        )
+        with (
+            mock.patch("websockets.sync.client.connect", return_value=ws),
+            PolicyClient("ws://unused") as client,
+            self.assertRaisesRegex(PolicyRemoteError, "already has a robot"),
+        ):
+            client.connect(_spec())
+
+    def test_send_failure_cannot_consume_a_queued_success(self) -> None:
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        closed = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+        ws = mock.Mock()
+        ws.send.side_effect = closed
+        ws.recv.return_value = protocol.encode_ready(
+            protocol.ReadyInfo(action_names=ACTIONS)
+        )
+        with (
+            mock.patch("websockets.sync.client.connect", return_value=ws),
+            PolicyClient("ws://unused") as client,
+        ):
+            with self.assertRaises(ConnectionClosedOK) as error:
+                client.connect(_spec())
+            self.assertIs(error.exception, closed)
 
 
 # ----------------------------------------------------------------------

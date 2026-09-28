@@ -32,7 +32,7 @@ import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -137,6 +137,7 @@ class _PolicyObservation:
     observation: RobotObservation
     capture_ts: float
     state_ts: float
+    camera_capture_ts: dict[str, float] = field(default_factory=dict)
 
 
 class _PolicySkewMonitor:
@@ -261,8 +262,8 @@ class AxolRobot(Robot):
         self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
-        # Built on connect() only when observe_cartesian is set; turns cached
-        # joint angles into end-effector poses for the observation.
+        # Built on connect() when observations or actions are Cartesian;
+        # converts measured joints for observations and dispatch safety checks.
         self._fk: AxolForwardKinematics | None = None
         # Full IK solver, built lazily the first time a Cartesian action is sent
         # (run-policy). Collect-data commands joint targets, so it never builds
@@ -457,10 +458,19 @@ class AxolRobot(Robot):
         return features
 
     @property
+    def cartesian_actions(self) -> bool:
+        explicit = getattr(self.config, "action_space", None)
+        return (
+            self.config.observe_cartesian
+            if explicit is None
+            else explicit == "cartesian"
+        )
+
+    @property
     def action_features(self) -> dict:
         if self._action_features is None:
-            if self.config.observe_cartesian:
-                # Mirror the observation: command each arm by a 6-axis EE pose
+            if self.cartesian_actions:
+                # Command each arm by a 6-axis EE pose independently of observations
                 # (resolved to joints via IK in send_action) plus gripper (when
                 # this robot has one).
                 gripper_l = [_LEFT_GRIPPER_KEY] if self._has_gripper else []
@@ -541,7 +551,9 @@ class AxolRobot(Robot):
             raise
         self._connect_future = None
 
-        if self.config.observe_cartesian and self._fk is None:
+        if (
+            self.config.observe_cartesian or self.cartesian_actions
+        ) and self._fk is None:
             from ...kinematics.fk import AxolForwardKinematics
 
             self._fk = AxolForwardKinematics()
@@ -739,11 +751,11 @@ class AxolRobot(Robot):
         The teleop produces joint-position targets; in cartesian mode the
         *recorded* action must match :attr:`action_features`, so the joint
         targets are mapped through forward kinematics to per-arm end-effector
-        poses (+ gripper). Identity when ``observe_cartesian`` is off. This does
+        poses (+ gripper). Identity when the action space is joint. This does
         not touch what is commanded to the arm — only the value stored in the
         dataset — so teleop keeps its exact joint fidelity.
         """
-        if not self.config.observe_cartesian:
+        if not self.cartesian_actions:
             return action
         left = self._pack_arm(action, self._left_pos_keys)
         right = self._pack_arm(action, self._right_pos_keys)
@@ -869,7 +881,34 @@ class AxolRobot(Robot):
     def _get_synchronized_observation(
         self,
     ) -> tuple[RobotObservation, float, float]:
-        """Build one synchronized observation; return (obs, exposure, state) times.
+        built = self._get_synchronized_observation_data()
+        return dict(built.observation), built.capture_ts, built.state_ts
+
+    @check_if_not_connected
+    def get_observation_with_sensor_timestamps(
+        self,
+    ) -> tuple[RobotObservation, int, dict[str, int]]:
+        """Atomic measured observation with actual sensor times in perf-counter ns.
+
+        Per-camera exposure times are retained even when the observation is
+        re-served from the cache. They are not replaced by its median exposure.
+        """
+        if not self.cameras:
+            raise RuntimeError(
+                "timestamped policy observations require camera/state alignment"
+            )
+        built = self._get_synchronized_observation_data()
+        return (
+            dict(built.observation),
+            round(built.state_ts * 1_000_000_000),
+            {
+                name: round(stamp * 1_000_000_000)
+                for name, stamp in built.camera_capture_ts.items()
+            },
+        )
+
+    def _get_synchronized_observation_data(self) -> _PolicyObservation:
+        """Build one synchronized observation retaining every sensor timestamp.
 
         The frame set is anchored on the **newest exposure every camera has
         already delivered**, not on "now": each camera pipeline (Argus → VIC →
@@ -913,7 +952,7 @@ class AxolRobot(Robot):
         """
         now = time.perf_counter()
         if not self.cameras:
-            return self._joint_state(), now, now
+            return _PolicyObservation(now, self._joint_state(), now, now)
         cameras = self.cameras
         slowest_fps = min(
             float(getattr(cam, "fps", None) or 30) for cam in cameras.values()
@@ -953,7 +992,7 @@ class AxolRobot(Robot):
         with self._policy_exposure_lock:
             last = self._last_policy_observation
         if last is not None and anchor_ts <= last.anchor_ts + 0.5 * period_s:
-            return dict(last.observation), last.capture_ts, last.state_ts
+            return last
 
         # 4. Take every camera's retained frame nearest the anchor. The lookup
         #    tolerance is the silence limit, not the alignment limit: a camera
@@ -1008,13 +1047,15 @@ class AxolRobot(Robot):
         )
         obs.update(frames)
 
-        built = _PolicyObservation(anchor_ts, obs, row_capture_ts, float(state_ts))
+        built = _PolicyObservation(
+            anchor_ts, obs, row_capture_ts, float(state_ts), capture_ts
+        )
         with self._policy_exposure_lock:
             last = self._last_policy_observation
             if last is None or anchor_ts > last.anchor_ts:
                 self._last_policy_observation = built
 
-        return dict(obs), row_capture_ts, float(state_ts)
+        return built
 
     @staticmethod
     def _newest_policy_exposure(cam_key: str, cam: object) -> tuple[float, float]:

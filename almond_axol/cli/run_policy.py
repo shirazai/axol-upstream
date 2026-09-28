@@ -44,6 +44,7 @@ from ..lerobot.rollout import (
     IKResetController,
     RolloutCaptureThread,
 )
+from ..policy.plan_scheduler import PlanRuntimeConfig
 from ..recording import (
     EpisodeDurabilityError,
     make_episode_durable,
@@ -146,7 +147,7 @@ class RunPolicyConfig:
     # server verbatim (e.g. to choose among the models it hosts).
     policy_path: str = ""
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
-    episode_time_s: int = 120
+    episode_time_s: int = 120  # 0 means operator-ended, continuous episodes in v2
     # Control/recording rate — must equal the fps the policy was trained at
     # (collect-data's default, 30). A 60 fps checkpoint needs --fps 60; the
     # sanity check below refuses a mismatch rather than replaying actions at
@@ -167,6 +168,10 @@ class RunPolicyConfig:
     device: str = "cuda"
     server_host: str | None = None
     server_port: int = 8765
+    # Protocol 1 preserves the original execution behavior; protocol 2 uses
+    # compressed observations and an unchanged-suffix plan dispatcher.
+    custom_protocol: int = 1
+    plan_config: PlanRuntimeConfig = field(default_factory=PlanRuntimeConfig)
     actions_per_chunk: int = 50
     chunk_size_threshold: float = 0.9
     aggregate_fn: AggregateFn = "temporal_ensemble"
@@ -1209,6 +1214,8 @@ def _build_axol_robot_client(
     custom_policy_url: str | None = None,
     custom_policy_path: str | None = None,
     allow_fps_mismatch: bool = False,
+    custom_protocol: int = 1,
+    plan_config: PlanRuntimeConfig | None = None,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
@@ -1390,7 +1397,11 @@ def _build_axol_robot_client(
             if (
                 exec_max_vel > 0.0
                 and exec_max_accel > 0.0
-                and not getattr(robot.config, "observe_cartesian", False)
+                and not getattr(
+                    robot,
+                    "cartesian_actions",
+                    getattr(robot.config, "observe_cartesian", False),
+                )
             ):
                 self._exec_filter = TrapezoidalFilter(
                     float(exec_max_vel),
@@ -2289,9 +2300,350 @@ def _build_axol_robot_client(
                 self._obs_ready.notify_all()
             self._policy_client.close()
 
-    client_class = (
-        AxolRobotClient if custom_policy_url is None else AxolCustomPolicyClient
-    )
+    class AxolPlanPolicyClient(AxolRobotClient):
+        """Version-2 transport and dispatcher; model semantics stay on the server.
+
+        The observation worker captures a coherent sensor/continuation request;
+        the receiver owns the single network round trip; the control worker
+        dispatches an unchanged row on an absolute periodic clock. Only local
+        scheduler bookkeeping is protected by ``_plan_ready``. Neither image
+        work, a network call nor a hardware send holds that lock.
+        """
+
+        def _open_transport(self) -> None:
+            from ..policy.plan_client import PlanPolicyClient
+            from ..policy.plan_scheduler import PlanScheduler
+
+            self._plan_config = plan_config or PlanRuntimeConfig()
+            self._scheduler = PlanScheduler(
+                fps=self.config.fps,
+                horizon=self.config.actions_per_chunk,
+                width=len(self._expected_action_schema),
+                config=self._plan_config,
+            )
+            self._policy_client = PlanPolicyClient(
+                custom_policy_url,
+                reply_timeout=self._plan_config.reply_timeout_s,
+            )
+            self._plan_ready = _threading.Condition(_threading.RLock())
+            self._plan_slot = None
+            self._network_busy = False
+            self._episode = 0
+            self._plan_last_target = None
+            self._wire_generation = None
+
+        def start(self) -> bool:
+            from ..lerobot.inference_wire import _observation_layout
+            from ..policy import CameraSpec
+            from ..policy.plan_protocol import PlanSpec
+
+            state_names, cameras = _observation_layout(
+                self.policy_config.lerobot_features
+            )
+            self._state_names = state_names
+            self._camera_names = tuple(name for name, _ in cameras)
+            cfg = self._plan_config
+            prepared_cameras = tuple(
+                CameraSpec(
+                    name,
+                    (
+                        (cfg.output_height, cfg.output_width, 3)
+                        if cfg.output_width
+                        else shape
+                    ),
+                )
+                for name, shape in cameras
+            )
+            spec = PlanSpec(
+                state_names=state_names,
+                action_names=self._expected_action_schema,
+                cameras=prepared_cameras,
+                fps=self.config.fps,
+                actions_per_chunk=self.config.actions_per_chunk,
+                request_interval=cfg.request_interval,
+                max_adoption_offset_steps=cfg.max_adoption_offset_steps,
+            )
+            self._policy_client.reply_timeout = CUSTOM_POLICY_SETUP_TIMEOUT_S
+            try:
+                accepted = self._policy_client.connect(spec)
+            finally:
+                self._policy_client.reply_timeout = cfg.reply_timeout_s
+            if accepted != spec:
+                raise ValueError(
+                    "plan server did not accept the exact execution specification"
+                )
+            self._action_schema_confirmed = True
+            self.shutdown_event.clear()
+            self.logger.info(
+                "Plan protocol 2 ready: %d Hz, horizon=%d, interval=%d, late=%s; "
+                "lossless compressed images; on-arrival replacement without blending",
+                spec.fps,
+                spec.actions_per_chunk,
+                cfg.request_interval,
+                cfg.late_policy,
+            )
+            return True
+
+        def _reset_server(self) -> None:
+            # _run proves the old episode workers exited before calling this.
+            with self._plan_ready:
+                if self._network_busy:
+                    raise RuntimeError(
+                        "cannot reset while plan inference is still running"
+                    )
+                self._scheduler.reset()
+                self._plan_slot = None
+                self._plan_last_target = None
+                self._episode += 1
+            self._policy_client.reset(self._episode)
+            self._wire_generation = self._scheduler.generation
+
+        def reset_episode_state(self) -> None:
+            super().reset_episode_state()
+            # Seed the first-step safety check from measured FK, not the first
+            # policy target. Subsequent checks use the actual dispatched target.
+            if getattr(self.robot, "cartesian_actions", False):
+                left, right = self.robot.positions
+                measured = self.robot._joints_to_cartesian(left, right)
+                self._plan_last_target = np.array(
+                    [measured[name] for name in self._expected_action_schema],
+                    dtype=np.float32,
+                )
+
+        def _plan_fail(self, exc: BaseException) -> None:
+            if self.running:
+                self.fatal_error = exc
+                self.logger.error("Plan policy failed: %s", exc)
+            self.shutdown_event.set()
+            with self._plan_ready:
+                self._scheduler.invalidate()
+                self._plan_slot = None
+                self._plan_ready.notify_all()
+
+        def observation_loop(self, task, verbose: bool = False) -> None:
+            from ..policy.plan_protocol import Continuation, PlanObservation
+            from ..policy.plan_scheduler import (
+                prepare_plan_images,
+                validate_sensor_times,
+            )
+
+            try:
+                self.start_barrier.wait()
+                while self.running:
+                    with self._plan_ready:
+                        if (
+                            self._network_busy
+                            or self._plan_slot is not None
+                            or not self._scheduler.request_due
+                        ):
+                            self._plan_ready.wait(timeout=self.config.environment_dt)
+                            continue
+                        generation = self._scheduler.generation
+                    raw, state_ns, camera_ns = (
+                        self.robot.get_observation_with_sensor_timestamps()
+                    )
+                    now_ns = time.perf_counter_ns()
+                    if set(camera_ns) != set(self._camera_names):
+                        raise ValueError(
+                            "camera timestamps do not match negotiated cameras"
+                        )
+                    validate_sensor_times(
+                        state_ns, camera_ns, now_ns, self._plan_config
+                    )
+                    with self._plan_ready:
+                        if (
+                            not self.running
+                            or generation != self._scheduler.generation
+                            or not self._scheduler.request_due
+                        ):
+                            continue
+                        pending = self._scheduler.begin_request(now_ns)
+                        delay = (
+                            self._scheduler.delay_steps
+                            if self._plan_config.advertise_delay
+                            else None
+                        )
+                    # Row origin and the continuation are already frozen; time
+                    # spent preparing/encoding images consumes this request's
+                    # original budget. Never replace only its observation.
+                    images = prepare_plan_images(
+                        {name: raw[name] for name in self._camera_names},
+                        self._plan_config,
+                    )
+                    observation = PlanObservation(
+                        request_id=pending.request_id,
+                        state=np.asarray(
+                            [raw[name] for name in self._state_names], dtype=np.float32
+                        ),
+                        images=images,
+                        state_sample_time_ns=state_ns,
+                        image_capture_time_ns=camera_ns,
+                        continuation=(
+                            None
+                            if pending.prediction_id is None
+                            else Continuation(
+                                pending.prediction_id,
+                                pending.from_row,
+                            )
+                        ),
+                        delay_steps=delay,
+                    )
+                    with self._plan_ready:
+                        if self.running and self._scheduler.is_pending(
+                            pending.request_id
+                        ):
+                            self._plan_slot = observation
+                            self._plan_ready.notify_all()
+            except _threading.BrokenBarrierError:
+                if self.running:
+                    self._plan_fail(RuntimeError("plan episode start barrier broke"))
+            except Exception as exc:
+                self._plan_fail(exc)
+
+        def receive_actions(self, verbose: bool = False) -> None:
+            from ..policy.plan_scheduler import (
+                PlanSchedulingError,
+                validate_sensor_times,
+            )
+
+            try:
+                self.start_barrier.wait()
+                while self.running:
+                    with self._plan_ready:
+                        self._plan_ready.wait_for(
+                            lambda: self._plan_slot is not None or not self.running,
+                            timeout=self.config.environment_dt,
+                        )
+                        if not self.running:
+                            return
+                        obs, self._plan_slot = self._plan_slot, None
+                        if obs is None or not self._scheduler.is_pending(
+                            obs.request_id
+                        ):
+                            continue
+                        self._network_busy = True
+                        generation = self._scheduler.generation
+                    try:
+                        if self._wire_generation != generation:
+                            # Recovery/hold clears desktop conditioning only
+                            # after old inference has drained. Local dispatch
+                            # was invalidated immediately, without this RPC.
+                            self._episode += 1
+                            self._policy_client.reset(self._episode)
+                            self._wire_generation = generation
+                        try:
+                            validate_sensor_times(
+                                obs.state_sample_time_ns,
+                                obs.image_capture_time_ns,
+                                time.perf_counter_ns(),
+                                self._plan_config,
+                            )
+                        except PlanSchedulingError:
+                            with self._plan_ready:
+                                self._scheduler.cancel_unsent(obs.request_id)
+                            continue
+                        reply = self._policy_client.infer(obs)
+                        with self._plan_ready:
+                            if self.running:
+                                accepted = self._scheduler.adopt(
+                                    reply.request_id,
+                                    reply.actions,
+                                    time.perf_counter_ns(),
+                                    reply.max_adoption_offset_steps,
+                                )
+                                if not accepted and self._scheduler.last_recovery:
+                                    self.logger.warning(
+                                        "Plan recovery: %s",
+                                        self._scheduler.last_recovery,
+                                    )
+                    finally:
+                        with self._plan_ready:
+                            self._network_busy = False
+                            self._plan_ready.notify_all()
+            except _threading.BrokenBarrierError:
+                if self.running:
+                    self._plan_fail(RuntimeError("plan episode start barrier broke"))
+            except Exception as exc:
+                self._plan_fail(exc)
+
+        def _check_plan_step(self, target: np.ndarray) -> None:
+            from ..policy.plan_scheduler import PlanSchedulingError
+
+            if not np.isfinite(target).all():
+                raise PlanSchedulingError("non-finite dispatch target")
+            if self._plan_last_target is not None:
+                names = self._expected_action_schema
+                for side in ("left", "right"):
+                    keys = [f"{side}_ee.{axis}" for axis in ("x", "y", "z")]
+                    if all(key in names for key in keys):
+                        indices = [names.index(key) for key in keys]
+                        step = float(
+                            np.linalg.norm(
+                                target[indices] - self._plan_last_target[indices]
+                            )
+                        )
+                        if step > self._plan_config.max_cartesian_step_m:
+                            raise PlanSchedulingError(
+                                f"{side} Cartesian step {step:.4f}m exceeds limit"
+                            )
+
+        def control_loop(self, task, verbose: bool = False) -> None:
+            try:
+                self.start_barrier.wait()
+                dt = self.config.environment_dt
+                deadline = time.perf_counter()
+                while self.running:
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0 and self.shutdown_event.wait(remaining):
+                        return
+                    now = time.perf_counter()
+                    with self._plan_ready:
+                        if now - deadline >= dt and self._scheduler.actions is not None:
+                            self._scheduler.recover("control dispatch deadline overrun")
+                            self._plan_slot = None
+                        popped = self._scheduler.pop()
+                        self._plan_ready.notify_all()
+                    if popped is not None and self.running:
+                        tick, target = popped
+                        self._check_plan_step(target)
+                        self._shape_and_send(target)
+                        self._plan_last_target = target.copy()
+                        self._exec_last_target = target
+                        with self.latest_action_lock:
+                            self.latest_action = tick
+                        if time.perf_counter() >= deadline + dt:
+                            with self._plan_ready:
+                                self._scheduler.recover(
+                                    "hardware dispatch exceeded control budget"
+                                )
+                                self._plan_slot = None
+                                self._plan_ready.notify_all()
+                    deadline += dt
+                    # Missed slots never trigger a burst of catch-up commands.
+                    if deadline < time.perf_counter():
+                        deadline = time.perf_counter() + dt
+            except _threading.BrokenBarrierError:
+                if self.running:
+                    self._plan_fail(RuntimeError("plan episode start barrier broke"))
+            except Exception as exc:
+                self._plan_fail(exc)
+
+        def stop(self) -> None:
+            self.shutdown_event.set()
+            self._action_schema_confirmed = False
+            with self._plan_ready:
+                self._scheduler.invalidate()
+                self._plan_slot = None
+                self._plan_ready.notify_all()
+            self._policy_client.close()
+
+    if custom_protocol not in (1, 2):
+        raise ValueError("custom_protocol must be 1 or 2")
+    client_class = AxolRobotClient
+    if custom_policy_url is not None:
+        client_class = (
+            AxolPlanPolicyClient if custom_protocol == 2 else AxolCustomPolicyClient
+        )
     return client_class(
         config,
         robot,
@@ -2367,6 +2719,19 @@ def _run(
     robot_config = cfg.robot_config
 
     custom_policy = policy_type == "custom"
+    custom_protocol = getattr(cfg, "custom_protocol", 1)
+    plan_config = getattr(cfg, "plan_config", None) or PlanRuntimeConfig()
+    if custom_protocol not in (1, 2):
+        raise ValueError("custom_protocol must be 1 or 2")
+    if custom_protocol == 2:
+        if not custom_policy:
+            raise ValueError("custom_protocol=2 requires policy_type=custom")
+        if episode_time_s < 0:
+            raise ValueError("episode_time_s must be nonnegative; 0 is continuous")
+        plan_config.validate(fps=fps, horizon=actions_per_chunk)
+        # Fail before camera discovery/robot construction if the selected
+        # compressed transport's optional image dependency is absent.
+        import PIL.Image  # noqa: F401
     if not custom_policy and not policy_path.strip():
         raise ValueError(
             f"--policy_path is required for a {policy_type!r} policy (a LeRobot "
@@ -2636,6 +3001,8 @@ def _run(
             custom_policy_url=custom_policy_url,
             custom_policy_path=policy_path.strip() or None,
             allow_fps_mismatch=cfg.allow_fps_mismatch,
+            custom_protocol=custom_protocol,
+            plan_config=plan_config,
         )
 
         _logger.info("Loading policy on server (one-time)...")
@@ -2649,7 +3016,11 @@ def _run(
         # send_action. Build that solver now, before the control loop, so its
         # one-time JIT warmup overlaps the return-to-rest + scene-reset prompt
         # below instead of stalling the first policy action.
-        if getattr(robot.config, "observe_cartesian", False):
+        if getattr(
+            robot.config,
+            "cartesian_actions",
+            getattr(robot.config, "observe_cartesian", False),
+        ):
             _logger.info("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
@@ -2706,9 +3077,13 @@ def _run(
 
             control.begin_episode()
 
+            episode_limit = (
+                "continuous; operator ends the episode"
+                if custom_protocol == 2 and episode_time_s == 0
+                else f"safety cap {episode_time_s}s"
+            )
             print(
-                f"  Press s=save+end, r=rerecord+end, q=quit "
-                f"(safety cap {episode_time_s}s).",
+                f"  Press s=save+end, r=rerecord+end, q=quit ({episode_limit}).",
                 flush=True,
             )
 
@@ -2745,7 +3120,11 @@ def _run(
                 if capture is not None:
                     capture.start()
 
-                deadline = time.perf_counter() + episode_time_s
+                deadline = (
+                    float("inf")
+                    if custom_protocol == 2 and episode_time_s == 0
+                    else time.perf_counter() + episode_time_s
+                )
                 try:
                     while True:
                         if stop_event.is_set():

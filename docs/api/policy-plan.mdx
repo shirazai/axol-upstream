@@ -1,0 +1,136 @@
+---
+title: "Plan policy protocol (v2)"
+description: "Compressed observations and cached action-plan continuation without model-specific robot code."
+---
+
+Version 2 adds a separate plan transport to the existing custom-policy SDK.
+Version 1 remains available unchanged. A v2 client and v1 server reject each
+other during the handshake; there is no automatic downgrade to raw images.
+
+The desktop owns the model, instruction text, normalization, conditioning,
+and its prediction cache. The robot owns capture, the dispatch clock, and
+replacement of future targets. Every reply contains absolute robot-space
+targets in the agreed action layout. The observation and action layouts may
+be different (for example, joint observations with Cartesian actions).
+
+## Setup
+
+`PlanPolicyClient.connect(spec)` sends `hello`. A successful server echoes the
+entire validated specification in `ready`; the client refuses any mismatch.
+
+```python
+from almond_axol.policy.plan_protocol import PlanSpec
+from almond_axol.policy.protocol import CameraSpec
+
+spec = PlanSpec(
+    state_names=("joint.left", "joint.right"),
+    action_names=("target.x", "target.y", "gripper"),
+    cameras=(CameraSpec("overhead", (288, 480, 3)),),
+    fps=30,
+    actions_per_chunk=30,
+    request_interval=10,
+    max_adoption_offset_steps=6,
+)
+```
+
+`hello` and `ready` both contain `protocol: "axol-policy"`, `version: 2`,
+ordered state/action names, cameras, and the four scheduling fields above.
+Each camera has `name`, prepared `shape: [height, width, 3]`, and `codec: "png"`.
+Camera preparation and action-name conventions must agree with the model
+adapter; `setup(spec)` should reject incompatible specifications.
+
+`max_adoption_offset_steps` is the greatest permitted age of a reply in
+control steps, relative to its locally saved request origin. It never delays
+an early response. `None` removes that additional deadline; rows still expire
+at their original scheduled times. The initial implementation requires PNG
+for every image, preserving RGB pixels exactly after configured preparation.
+
+## Recurring request and reply
+
+Each WebSocket message is binary: a big-endian uint32 JSON-header byte count,
+that many UTF-8 JSON bytes, then the binary payload. The same framing is used
+by v1. WebSocket compression is disabled because image data is already PNG.
+
+An `infer` header is:
+
+```json
+{
+  "type": "infer",
+  "request_id": "episode-1-request-42",
+  "observation": {
+    "state": [0.1, -0.2],
+    "state_sample_time_ns": 100000001,
+    "images": [
+      {"name": "overhead", "capture_time_ns": 99999999, "byte_length": 12345}
+    ]
+  },
+  "continuation": {"prediction_id": "episode-1-request-41", "from_row": 10}
+}
+```
+
+The image payload concatenates complete PNG byte streams in negotiated camera
+order. Timestamps are integer nanoseconds in one robot monotonic clock; they
+are not comparable to the desktop clock. The SDK exposes decoded RGB uint8
+arrays to the model adapter. Camera count/order/shape, PNG format, lengths,
+finite state values, and all message fields are validated.
+
+`continuation` identifies the actual accepted prediction and its first
+remaining row. It means the queued targets are an unchanged suffix of that
+prediction, not merely that it was the last one generated. It is `null` on
+bootstrap or after a reset. A missing cache entry or exhausted suffix is an
+error; the server does not silently use a different plan. Robot-side temporal
+blending or editing of queued targets is incompatible with this compact
+reference. Low-level control/filtering remains downstream of those targets.
+
+Fixed-budget adapters receive no latency field. An adaptive adapter may opt
+into the optional top-level integer `delay_steps`; it is conditioning input,
+never a command to delay adoption. The generic runtime caps its estimate at
+`actions_per_chunk`; that value means a full horizon or longer. Instruction
+text stays on the desktop.
+
+The `actions` reply header contains:
+
+```json
+{
+  "type": "actions",
+  "request_id": "episode-1-request-42",
+  "shape": [30, 3]
+}
+```
+
+Its payload is row-major little-endian float32 values. An optional
+`max_adoption_offset_steps` may tighten the negotiated deadline for this
+reply. There are no absolute robot ticks on the wire. The robot associates
+row zero with the request origin saved locally, drops elapsed or irrevocable
+rows, and adopts the remaining suffix immediately. An XR-1 fixed prefix and
+RTC-guided rows require the same robot-side replacement operation.
+
+## Lifecycle and failure
+
+After connecting, call `client.reset(episode)` before the first inference.
+`reset` carries an integer `episode`; `reset_ok` echoes it. Reset clears all
+desktop predictions and recurrent state. Request IDs are nonempty strings,
+unique within an episode. Only one request may be outstanding on a client.
+
+On a hold, task change, or new episode, invalidate pending predictions in the
+local scheduler immediately. Then serialize `reset` after any outstanding
+request. Do not let a pre-reset reply repopulate the robot queue. Changing
+desktop instruction text must follow this episode boundary too.
+
+An error reply has `type: "error"` and `message`. A malformed request, unknown
+continuation, invalid model output, or client timeout closes the session.
+Recovery reconnects and explicitly resets; a late reply cannot be mistaken
+for a subsequent request. A server permits one active robot connection.
+
+## Desktop adapter
+
+Subclass `PlanPolicy` from `almond_axol.policy.plan_server`, implementing
+`setup(spec)`, `reset()`, and `infer(obs)`. Return a float32 action matrix or
+`PlanActions` to specify a tighter adoption deadline. Launch with
+`PlanPolicyServer(policy, host="0.0.0.0", port=8765).serve_forever()`.
+
+The optional `PredictionCache` utility stores immutable float32 predictions.
+Call `remaining(obs.continuation)` before sampling and `put(obs.request_id,
+actions)` afterward. It retains the referenced accepted plan across repeated
+rejected candidates. The adapter should apply its own continuity algorithm
+to that suffix and clear its cache on `reset()`.

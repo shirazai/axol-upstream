@@ -7,6 +7,7 @@ exercise a policy server without a robot (see ``axol policy.check``).
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -119,22 +120,34 @@ class PolicyClient:
         """Close the connection; safe to call from another thread to unblock a request."""
         ws, self._ws = self._ws, None
         if ws is not None:
-            try:
+            with contextlib.suppress(Exception):
                 ws.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
 
     def _request(self, message: bytes) -> tuple[dict[str, Any], memoryview]:
+        from websockets.exceptions import ConnectionClosed
+
         ws = self._ws
         if ws is None:
             raise PolicyProtocolError("Policy connection is closed.")
-        ws.send(message)
+        try:
+            ws.send(message)
+        except ConnectionClosed as closed:
+            # A refused session may receive error + close before hello is
+            # sent. WebSocket receive still exposes that queued error. Never
+            # treat any queued success as the reply to an unsent request.
+            try:
+                reply = ws.recv(timeout=self.reply_timeout)
+            except (ConnectionClosed, TimeoutError):
+                raise closed from None
+            header, payload = decode_message(reply)
+            if header.get("type") != "error":
+                raise closed
+            return header, payload
         try:
             reply = ws.recv(timeout=self.reply_timeout)
         except TimeoutError:
             raise TimeoutError(
-                f"Policy server at {self.url} did not reply within "
-                f"{self.reply_timeout:.0f}s."
+                f"Policy server at {self.url} did not reply within {self.reply_timeout:.0f}s."
             ) from None
         return decode_message(reply)
 
