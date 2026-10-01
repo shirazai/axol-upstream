@@ -86,10 +86,14 @@ uses measured time across overruns and preserves command derivatives. It retains
 the realtime core's watchdog and command validation. Changing backend therefore
 changes tracking semantics, not just solver speed.
 
-The default policy solver profile is calibrated for 30 Hz execution. Teleop
-passes its configured IK frequency to the solver. A different policy execution
-rate requires matching `MinkIKConfig.mink_solve_hz` when constructing the robot
-through the SDK and validating the resulting motion.
+The default policy solver profile is calibrated for 30 Hz execution. `run-policy`
+and `collect-dagger` pass their configured `fps` to Mink's posture speed gate;
+teleop passes its configured IK frequency. SDK callers can pass
+`AxolRobot(config, mink_solve_hz=60)` for a 60 Hz policy. This copies the supplied
+`MinkIKConfig` and changes only its cadence; omitting the keyword preserves an
+explicit config's cadence or the 30 Hz default. The cadence is fixed when the
+robot is constructed. Validate physical tracking at the deployment's chosen
+rate; configuring the correct cadence does not guarantee a solve fits its budget.
 
 To reproduce a deployment, record the effective camera order/resizing, world
 frame, control rates, request interval, rest poses, gains, gripper torque limits,

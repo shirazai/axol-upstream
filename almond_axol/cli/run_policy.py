@@ -2036,7 +2036,13 @@ def _build_axol_robot_client(
             }
             performed = self.robot.send_action(action)
             if self._publisher is not None and performed is not None:
-                self._publisher.publish(performed)
+                recorded = performed
+                if any(key not in recorded for key in self.robot.action_features):
+                    # Mink returns the joint commands actually dispatched. A
+                    # Cartesian dataset needs their FK poses, not the original
+                    # policy targets (which IK may not have reached).
+                    recorded = self.robot.action_to_dataset(performed)
+                self._publisher.publish(recorded)
             # Tracking contact watchdog: a torque residual sustained above
             # the threshold means the policy is pushing/pulling on something
             # beyond legitimate task contact — abort the episode so the
@@ -2787,7 +2793,12 @@ def _run(
                 "them in the Cameras dialog."
             )
 
-    robot = AxolRobot(robot_config)
+    robot_options = (
+        {"mink_solve_hz": fps}
+        if getattr(robot_config, "cartesian_controller", "jax") == "mink"
+        else {}
+    )
+    robot = AxolRobot(robot_config, **robot_options)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 
     # Camera feature shapes must be known before either creating or resuming a

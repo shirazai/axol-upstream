@@ -32,7 +32,8 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from numbers import Real
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -241,7 +242,33 @@ class AxolRobot(Robot):
         config: AxolRobotConfig,
         *,
         ik_config: "KinematicsConfig | MinkIKConfig | None" = None,
+        mink_solve_hz: float | None = None,
     ) -> None:
+        """Create the robot with a fixed Cartesian solver cadence.
+
+        ``mink_solve_hz`` overrides only the cadence in a copied Mink config;
+        omitted, it preserves an explicit config's cadence or the 30 Hz default.
+        Configure this before connecting; a different cadence needs a new robot.
+        """
+        if config.cartesian_controller == "mink":
+            from ...policy.mink_ik import MinkIKConfig
+
+            if ik_config is None:
+                ik_config = MinkIKConfig()
+            if not isinstance(ik_config, MinkIKConfig):
+                raise TypeError("The Mink controller requires MinkIKConfig")
+            rate = ik_config.mink_solve_hz if mink_solve_hz is None else mink_solve_hz
+            if (
+                isinstance(rate, bool)
+                or not isinstance(rate, Real)
+                or not (np.isfinite(rate) and rate > 0)
+            ):
+                raise ValueError("mink_solve_hz must be finite and positive")
+            # The tracker and its speed gate retain this object. Own a snapshot
+            # so later caller edits cannot silently change a warmed solver.
+            ik_config = replace(ik_config, mink_solve_hz=float(rate))
+        elif mink_solve_hz is not None:
+            raise ValueError("mink_solve_hz requires cartesian_controller='mink'")
         super().__init__(config)
         self.config = config
         # Feature keys for the joints this robot actually has: the gripperless

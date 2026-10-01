@@ -334,6 +334,74 @@ class MinkRobotControllerTest(unittest.TestCase):
         )
         self.solver.reset_tracking_state.assert_called_once_with()
 
+    def _recording_client(self):
+        from almond_axol.lerobot.inference_patch import (
+            import_robot_client_preserving_logging,
+        )
+        from almond_axol.lerobot.rollout import ActionPublisher
+
+        import_robot_client_preserving_logging()
+        publisher = ActionPublisher()
+        config = SimpleNamespace(
+            fps=30,
+            environment_dt=1 / 30,
+            server_address="unused",
+            policy_type="custom",
+            pretrained_name_or_path="custom",
+            actions_per_chunk=30,
+            policy_device="cpu",
+            client_device="cpu",
+            task="recording regression",
+            aggregate_fn=None,
+        )
+        client = run_policy._build_axol_robot_client(
+            config=config,
+            robot=self.robot,
+            publisher=publisher,
+            custom_policy_url="ws://unused",
+        )
+        self.addCleanup(client.stop)
+        client._action_schema_confirmed = True
+        self.robot._axol.torque_residuals = lambda: (np.zeros(7), np.zeros(7))
+        return client, publisher
+
+    def test_policy_recording_maps_dispatched_mink_joints_to_cartesian_schema(self):
+        from lerobot.utils.feature_utils import build_dataset_frame
+
+        from almond_axol.kinematics.mujoco_fk import AxolForwardKinematics
+        from almond_axol.recording.datasets import dataset_features_for_robot
+
+        self.robot._fk = AxolForwardKinematics()
+        client, publisher = self._recording_client()
+        performed = client._shape_and_send(np.array(list(self.action.values())))
+        recorded = publisher.latest()
+        self.assertEqual(set(performed), set(self.robot.observation_features))
+        self.assertEqual(set(recorded), set(self.robot.action_features))
+        _, left, right = self.dispatches[-1]
+        left_pose, right_pose = self.robot._fk.ee_poses(left, right)
+        np.testing.assert_allclose(
+            list(recorded.values()), np.r_[left_pose, left[7], right_pose, right[7]]
+        )
+        self.assertNotEqual(recorded["left_ee.z"], self.action["left_ee.z"])
+        features = dataset_features_for_robot(self.robot)
+        frame = build_dataset_frame(features, recorded, prefix="action")
+        self.assertEqual(frame["action"].shape, (14,))
+        self.assertTrue(np.isfinite(frame["action"]).all())
+
+    def test_policy_recording_preserves_actions_already_in_dataset_schema(self):
+        client, publisher = self._recording_client()
+        with (
+            mock.patch.object(self.robot, "send_action", return_value=self.action),
+            mock.patch.object(
+                self.robot,
+                "action_to_dataset",
+                side_effect=AssertionError("already in Cartesian schema"),
+            ),
+        ):
+            performed = client._shape_and_send(np.array(list(self.action.values())))
+        self.assertIs(performed, self.action)
+        self.assertEqual(publisher.latest(), self.action)
+
     def test_overlapping_mink_sends_are_refused_before_second_solve(self):
         entered = threading.Event()
         release = threading.Event()
@@ -532,13 +600,14 @@ class MinkStartupTest(unittest.TestCase):
     def test_cli_prepares_mink_and_selects_rest_posture_before_connect(self):
         from almond_axol.teleop.config import VRTeleopConfig
 
-        for explicit in (True, False):
-            with self.subTest(explicit=explicit):
+        for explicit, fps in ((True, 15), (False, 30), (True, 60)):
+            with self.subTest(explicit=explicit, fps=fps):
                 defaults = VRTeleopConfig()
                 cfg = run_policy.RunPolicyConfig(
                     policy_type="custom",
                     task="test",
                     actions_per_chunk=30,
+                    fps=fps,
                     robot_config=AxolRobotConfig(
                         action_space="cartesian", cartesian_controller="mink"
                     ),
@@ -552,6 +621,9 @@ class MinkStartupTest(unittest.TestCase):
                     cfg.rest_pose_right if explicit else defaults.rest_pose_right
                 )
                 result = self.run_until_connect(cfg)
+                result.constructor.assert_called_once_with(
+                    cfg.robot_config, mink_solve_hz=fps
+                )
                 self.assertEqual(result.events, ["prepare", "posture", "connect"])
                 left, right = result.robot.set_cartesian_posture.call_args.args
                 np.testing.assert_allclose(left, expected_left)
@@ -603,7 +675,9 @@ class MinkStartupTest(unittest.TestCase):
                 ("lerobot.processor.make_default_processors", (None, None, None)),
                 ("lerobot.async_inference.configs.RobotClientConfig", object()),
             ):
-                stack.enter_context(mock.patch(target, return_value=value))
+                patched = stack.enter_context(mock.patch(target, return_value=value))
+                if target.endswith(".AxolRobot"):
+                    constructor = patched
             stack.enter_context(mock.patch.object(run_policy, "IKResetController"))
             stack.enter_context(mock.patch.object(run_policy, "ActionPublisher"))
             stack.enter_context(
@@ -616,7 +690,12 @@ class MinkStartupTest(unittest.TestCase):
                 RuntimeError if prepare_failure is None else ValueError
             ) as raised:
                 run_policy._run(cfg, stop_event=threading.Event(), control=mock.Mock())
-        return SimpleNamespace(robot=robot, events=events, failure=raised.exception)
+        return SimpleNamespace(
+            robot=robot,
+            events=events,
+            failure=raised.exception,
+            constructor=constructor,
+        )
 
 
 if __name__ == "__main__":

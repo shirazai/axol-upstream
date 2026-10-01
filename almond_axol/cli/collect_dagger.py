@@ -1319,7 +1319,12 @@ def _run(
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
-    robot = AxolRobot(cfg.robot_config)
+    robot_options = (
+        {"mink_solve_hz": fps}
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink"
+        else {}
+    )
+    robot = AxolRobot(cfg.robot_config, **robot_options)
     teleop = DaggerVRTeleop(cfg.teleop_config)
     teleop.set_hold_to_intervene(cfg.hold_to_intervene)
     from ..recording.datasets import (
