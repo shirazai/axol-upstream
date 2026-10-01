@@ -6,8 +6,11 @@ repos:
     # Run the linter.
     - id: ruff
       args: [--fix, --extend-select, I]
+      # Frozen solver sources are checked by their provenance/hash fixtures.
+      exclude: ^almond_axol/policy/mink_ik/ik(?:_config|_mink_backend|_mujoco_model)?\.py$
     # Run the formatter.
     - id: ruff-format
+      exclude: ^almond_axol/policy/mink_ik/ik(?:_config|_mink_backend|_mujoco_model)?\.py$
 - repo: local
   hooks:
     # Format the web/ TypeScript app with the same Prettier version it pins.

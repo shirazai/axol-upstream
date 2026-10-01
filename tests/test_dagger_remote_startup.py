@@ -20,8 +20,9 @@ class _ReachedConnect(RuntimeError):
 @pytest.mark.parametrize(
     "ready_result", [True, False, RuntimeError("reset worker failed")]
 )
+@pytest.mark.parametrize("backend", ["jax", "mink"])
 def test_remote_startup_uses_selected_rest_pose_and_waits_before_connect(
-    tmp_path, ready_result
+    tmp_path, ready_result, backend
 ):
     config = collect_dagger.DaggerConfig(
         policy_type="custom",
@@ -34,6 +35,8 @@ def test_remote_startup_uses_selected_rest_pose_and_waits_before_connect(
     )
     config.robot_config.cameras["overhead"].serial = 1234
     config.robot_config.action_space = "cartesian"
+    config.robot_config.cartesian_controller = backend
+    config.teleop_config.kinematics_config.backend = backend
     config.teleop_config.vr_teleop_config.rest_pose_left = [0.1] * 7
     config.teleop_config.vr_teleop_config.rest_pose_right = [-0.2] * 7
     events = []
@@ -89,6 +92,8 @@ def test_remote_startup_uses_selected_rest_pose_and_waits_before_connect(
     construct.assert_called_once_with(
         rest_pose_left=[0.1] * 7,
         rest_pose_right=[-0.2] * 7,
+        kinematics_config=config.teleop_config.kinematics_config,
+        vr_teleop_config=config.teleop_config.vr_teleop_config,
     )
     reset.start.assert_called_once_with()
     reset.wait_ready.assert_called_once()
