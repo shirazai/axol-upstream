@@ -72,6 +72,12 @@ For DAgger, select `hold_to_intervene`, `record_joint_actions`, the matching Min
 teleop backend, and a dataset destination. Rest poses and contact thresholds for
 collection live under `teleop_config.vr_teleop_config`.
 
+Policy rollout actions are recorded in the configured action space. For Mink
+Cartesian actions, the recorder uses forward kinematics of the dispatched joint
+commands; an unreachable policy target is not substituted for the resolved
+command. Remote DAgger can instead retain joint training actions with
+`record_joint_actions: true`, independently of the policy's action space.
+
 ## Execution and coordinate frames
 
 Public Cartesian actions and observations use the current Axol world frame and
@@ -114,6 +120,12 @@ The planner retains joint-posture goals as well as tool poses. Seven-joint arms
 can reach the same tool pose with different elbows; a successful reset must
 reach the configured joint posture. Parking still performs rest and then the
 zero joint goal, and waits for measured settling before motor release.
+
+This full park applies to explicit quit in remote DAgger and to `run-policy`
+with `soft_park_on_quit: true`. With that policy option enabled, interrupt/error
+exits preserve support instead. Ordinary `collect-data` retains the vendor's
+different shutdown sequence: best-effort return to rest, then disconnect. It does
+not perform the full rest-to-zero park or preserve support on a failed return.
 
 A straight path is not always feasible. Joint limits, modeled self-collision,
 unreachable targets, excessive steps or an unreached endpoint reject the plan.

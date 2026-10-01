@@ -100,6 +100,7 @@ jobs:
           tests/test_mink_trajectory.py
           tests/test_mink_lifecycle.py
           tests/test_mink_robot_controller.py
+          tests/test_mink_policy_cadence.py
 
   rust:
     name: Rust realtime core
