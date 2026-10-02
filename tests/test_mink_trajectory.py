@@ -30,7 +30,7 @@ def solver():
 
 @pytest.fixture(scope="module")
 def recorded():
-    with np.load(Path(__file__).parent / "data/mink_ik_legacy/stream.npz") as data:
+    with np.load(Path(__file__).parent / "data/mink_ik_reference/stream.npz") as data:
         return {key: data[key].copy() for key in data.files}
 
 

@@ -627,7 +627,7 @@ class AxolRobot(Robot):
             max_vel=VRTeleopConfig.teleop_max_vel,
             max_accel=VRTeleopConfig.teleop_max_accel,
             record=self._control_trace,
-            tracking_profile="legacy_mink" if self._uses_mink else "default",
+            tracking_profile="mink" if self._uses_mink else "default",
         )
 
     async def _connect_async(self) -> None:
@@ -1354,8 +1354,8 @@ class AxolRobot(Robot):
     def _mink_action_to_targets(
         self, action: RobotAction
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Legacy Mink seed/solve with no Python joint filtering afterward."""
-        from ...policy.mink_ik import pose6_current_to_legacy
+        """Resolve Mink targets using a persistent seed and Rust joint filtering."""
+        from ...policy.mink_ik import pose6_world_to_model
 
         with self._mink_lock:
             solver = self._ensure_ik()
@@ -1388,8 +1388,8 @@ class AxolRobot(Robot):
             result = np.asarray(
                 solver.solve(
                     seed,
-                    pose6_current_to_legacy(values[:6]),
-                    pose6_current_to_legacy(values[6:]),
+                    pose6_world_to_model(values[:6]),
+                    pose6_world_to_model(values[6:]),
                 ),
                 dtype=np.float32,
             )

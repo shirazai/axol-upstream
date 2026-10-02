@@ -32,7 +32,7 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 | Extra | Purpose |
 |-------|---------|
-| `jax` | Default JAX IK and legacy planning commands; required when using default kinematics settings |
+| `jax` | Default JAX IK and planning commands; required when using default kinematics settings |
 | `mink` | Mink tracking, Cartesian observations, and reset/return without JAX; select Mink in session configuration |
 | `sim` | viser (browser 3D visualizer) — needed for sim mode |
 | `lerobot` | LeRobot data collection/policy — requires hardware + ZED cameras. Not needed for teleop camera streaming: the ZED SDK cameras live in `almond_axol/video/zed_sdk.py` and `almond_axol/lerobot/camera` only wraps them in LeRobot's `Camera`/`CameraConfig` |

@@ -52,7 +52,7 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `jax` | JAX, jaxlie, almond-pyroki / almond-jaxls | Default JAX IK and legacy planning commands |
+| `jax` | JAX, jaxlie, almond-pyroki / almond-jaxls | Default JAX IK and planning commands |
 | `mink` | Mink, MuJoCo, DAQP | Mink tracking, Cartesian observations, and reset/return planning without JAX |
 | `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |

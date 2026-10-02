@@ -1,28 +1,18 @@
-"""Velocity-QP tracking backend (mink + daqp).  # shiraz (shirazai/shiraz#210)
+"""Velocity-QP tracking backend using Mink and DAQP.
 
-Per-tick differential IK in the OpenArm/mink formulation: joint limits and
-per-tick velocity as **hard QP constraints** (direction-preserving, unlike a
-componentwise output clamp), global Tikhonov damping for singularity
-robustness, a fixed rest-pose posture attractor for the null space, and
-optional hard self-collision rows on the vendor torso<->arm pair scope.
+Per-tick differential IK uses hard joint and velocity constraints, global
+Tikhonov damping for singularity robustness, a rest-pose posture attractor
+and optional torso-to-arm collision constraints. Forward kinematics and
+reset planning use MuJoCo and separate Mink state.
 
-This replaces only the per-tick tracking solve inside
-:class:`~almond_axol.kinematics.solver.KinematicsSolver` (``backend="mink"``);
-FK, reset-trajectory planning, and the engage/snap machinery stay on pyroki.
+The interface maps joint vectors to MuJoCo qpos by name. Non-arm degrees
+of freedom are frozen by equality constraints and copied from the input.
+Per-iteration velocity limits bound the call's total joint displacement,
+leaving the caller's componentwise clamp as a backstop.
 
-Design notes:
-
-- The QP works in MuJoCo qpos space; ``q`` vectors at the interface stay in
-  the pyroki actuated-joint order and are mapped by joint NAME, so the
-  backend is agnostic to whether the finger joints are part of ``q``.
-- Non-arm dofs (the gripper finger sliders) are frozen with an equality
-  constraint and spliced back from the input, so they never move here.
-- Per-call displacement is bounded to ``config.mink_max_joint_delta`` by
-  construction (per-iteration ``VelocityLimit``); the caller's outer clamp
-  becomes a never-binding backstop instead of a direction-distorting box.
-- Failure ladder per iteration: constrained solve -> retry without the
-  collision rows -> hold (return the seed unchanged). Drop-and-warn, never
-  raise: an IK hiccup must not kill the dispatch thread.
+Each iteration first solves with collision constraints, retries without
+collision constraints if necessary, then returns the seed unchanged if
+both attempts fail. The failure counter makes these holds observable.
 """
 
 from __future__ import annotations
@@ -33,18 +23,17 @@ import mink
 import mujoco
 import numpy as np
 
-from almond_axol.constants import Joint, urdf_body_name  # xr1-rustcore: K34 edit 1/4
-from .ik_config import PINNED_URDF, MinkIKConfig as KinematicsConfig  # xr1-rustcore: K34 edit 2/4
-from .ik_mujoco_model import body_geom_ids, load_mj_model, qpos_indices  # xr1-rustcore: K34 edit 3/4
+from almond_axol.constants import Joint, urdf_body_name
+
+from .ik_config import PINNED_URDF
+from .ik_config import MinkIKConfig as KinematicsConfig
+from .ik_mujoco_model import body_geom_ids, load_mj_model, qpos_indices
 
 _logger = logging.getLogger(__name__)
 
-# Arm bodies guarded against the torso, per side (the vendor torso<->arm
-# collision scope: fingers and TCP frames excluded). The s2 shoulder-yoke
-# body is ALSO excluded: it rotates captive inside the torso mount, so its
-# mesh legitimately rides at 0-10 mm clearance through the normal workspace
-# — that interference is constrained by joint limits, not by IK (the vendor
-# capsule model reaches the same outcome via its home-penetration pass).
+# Arm bodies guarded against the torso, excluding fingers and TCP frames.
+# The s2 shoulder yoke rotates inside the torso mount with 0-10 mm clearance;
+# joint limits constrain this designed overlap rather than collision IK.
 _ARM_BODY_SUFFIXES = ("s3", "e1", "e2", "w0", "w1", "w2", "gripper")
 _TORSO_BODIES = ("base", "s1")
 
@@ -54,16 +43,15 @@ _DELTA_BUDGET = 0.98
 
 
 class MinkTracker:
-    """Velocity-QP tracker with the :meth:`solve` contract of the NLLS path.
+    """Velocity-QP tracker over a caller-specified joint ordering.
 
     Args:
-        config: Kinematics configuration (``mink_*`` fields).
-        joint_names: Actuated joint names in the caller's ``q`` order.
-        arm_joint_names: The 14 arm joint names (left then right); these are
-            the dofs the QP may move — everything else is frozen.
-        ee_bodies: ``(left, right)`` end-effector body names (the IK target
-            frame — the gripper bodies, not the TCPs).
-        elbow_bodies: ``(left, right)`` elbow body names for the hint tasks.
+        config: Solver weights and limits (``mink_*`` fields).
+        joint_names: Actuated joint names in the caller's vector order.
+        arm_joint_names: The 14 arm joints that the QP may move; other degrees
+            of freedom remain frozen.
+        ee_bodies: Left and right end-effector body names.
+        elbow_bodies: Left and right elbow body names for optional hint tasks.
     """
 
     def __init__(
@@ -75,7 +63,7 @@ class MinkTracker:
         elbow_bodies: tuple[str, str],
     ) -> None:
         self._config = config
-        self._model = load_mj_model(PINNED_URDF)  # xr1-rustcore: K34 edit 4/4
+        self._model = load_mj_model(PINNED_URDF)
         self._configuration = mink.Configuration(self._model)
 
         # Name-mapped views between the caller's q order and MuJoCo qpos.
@@ -86,16 +74,13 @@ class MinkTracker:
         # retreat row (0.95×violation per iteration) contradict the velocity
         # rows for violations over ~1°, turning every solve infeasible — a
         # permanent hold. Clamping recovers at the outer clamp's walk-back
-        # rate instead (the jaxls backend recovers softly via its limit
-        # cost; this is the hard-constraint equivalent).
+        # rate while retaining hard joint constraints.
         jids = [
             mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, n)
             for n in self._q_names
         ]
         limited = self._model.jnt_limited[jids].astype(bool)
-        self._q_lo = np.where(
-            limited, self._model.jnt_range[jids, 0], -np.inf
-        )
+        self._q_lo = np.where(limited, self._model.jnt_range[jids, 0], -np.inf)
         self._q_hi = np.where(limited, self._model.jnt_range[jids, 1], np.inf)
         arm_set = set(arm_joint_names)
         self._frozen_dofs = [
@@ -135,19 +120,17 @@ class MinkTracker:
         # quadratically above mink_posture_speed_gate (see config). The
         # applied scale is additionally rate-limited through a one-pole
         # low-pass (mink_posture_gate_tau) so a speed-gate crossing shifts
-        # the QP optimum over ~tau instead of snapping it in one solve —
-        # ep4 of motion_benchmarks_5 measured a 0.46 rad null-space snap in
-        # 0.25 s when the hand re-crossed the gate after a slow phase.
+        # the QP optimum over ~tau instead of snapping it in one solve.
         self._gate_scale: float | None = None
         self._last_ee_target: dict[str, np.ndarray | None] = {
-            "left": None, "right": None,
+            "left": None,
+            "right": None,
         }
 
         # Elbow-hint projection: with position_multiplier > 1 the scaled
         # human elbow hint orbits well outside the robot elbow's reachable
-        # sphere (~0.55 m demanded vs ~0.40 m reachable on the recorded
-        # sessions) — an unreachable point target tilts the whole arm (the
-        # "elbow way too high" symptom) instead of shaping its direction.
+        # sphere. An unreachable point target tilts the whole arm instead
+        # of shaping the elbow direction.
         # Project every hint onto the sphere about the (fixed) shoulder
         # center so the task carries direction only.
         data = mujoco.MjData(self._model)
@@ -160,12 +143,11 @@ class MinkTracker:
             ("left", "right"), (True, False), elbow_bodies, strict=True
         ):
             sid = mujoco.mj_name2id(
-                self._model, mujoco.mjtObj.mjOBJ_BODY,
+                self._model,
+                mujoco.mjtObj.mjOBJ_BODY,
                 urdf_body_name(Joint.SHOULDER_1, is_left=is_left),
             )
-            eid = mujoco.mj_name2id(
-                self._model, mujoco.mjtObj.mjOBJ_BODY, elbow_body
-            )
+            eid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, elbow_body)
             self._shoulder_pos[side] = data.xpos[sid].copy()
             self._elbow_bid[side] = eid
             self._elbow_radius[side] = float(
@@ -214,12 +196,11 @@ class MinkTracker:
     def _home_feasible_collision_pairs(
         self,
     ) -> list[tuple[list[int], list[int]]]:
-        """Torso<->arm geom pairs, minus any already too close at home.
+        """Select torso-to-arm geometry pairs that are feasible at home.
 
-        Mirrors the vendor collision model: pairs that violate the clearance
-        at the home pose are over-conservative fits the IK could never
-        separate — keeping them would make the home configuration infeasible
-        for the hard rows.
+        Pairs already inside the clearance margin at home are excluded: their
+        conservative geometry would make the home pose infeasible for hard
+        collision constraints.
         """
         torso = body_geom_ids(self._model, list(_TORSO_BODIES))
         arms = body_geom_ids(
@@ -258,26 +239,22 @@ class MinkTracker:
             self._posture_task.set_target(self._to_qpos(q))
 
     def reset_tracking_state(self) -> None:
-        """Clear cross-call gate memory at a control discontinuity.
+        """Clear cross-call posture-gate memory at a target discontinuity.
 
-        shiraz (shirazai/shiraz#523): ``_last_ee_target``/``_gate_scale``
-        persist across calls by design (the speed finite-difference), but a
-        hand-back / episode seam moves the EE target discontinuously — the
-        stale memory would read as a huge one-call speed spike and then
-        recover only over ``mink_posture_gate_tau``. Callers that re-anchor
-        the seed at a discontinuity (``reset_cartesian_seed``) clear this
-        too; the warmup dummy solve is also flushed this way.
+        Previous targets estimate demand speed. A handover, episode boundary or
+        seed reset can change the target abruptly; retained history would cause
+        a false speed spike that decays over ``mink_posture_gate_tau``. Warmup
+        also clears this history before control begins.
         """
         self._last_ee_target = {"left": None, "right": None}
         self._gate_scale = None
 
     @property
     def fail_count(self) -> int:
-        """QP solves that fell through the failure ladder to a HOLD.
+        """Number of solves that exhausted both attempts and held the seed.
 
-        shiraz (shirazai/shiraz#523): a failed solve returns the seed
-        unchanged — a frozen command the guards cannot see. Consumers export
-        this so a session verdict can complain instead of reading clean.
+        A held command alone does not distinguish solver failure from a static
+        target; callers can expose this counter in session diagnostics.
         """
         return self._fail_count
 
@@ -293,10 +270,9 @@ class MinkTracker:
         left_elbow_pos: np.ndarray | None,
         right_elbow_pos: np.ndarray | None,
     ) -> np.ndarray:
-        """One tracking step; same target semantics as the NLLS ``ik()``.
+        """Return one tracking step in the caller's joint ordering.
 
-        Returns the next joint vector in the caller's ``q`` order. Frozen
-        (non-arm) entries pass through from ``q_current`` unchanged.
+        Frozen non-arm entries pass through from ``q_current`` unchanged.
         """
         cfg = self._config
         self._configuration.update(self._to_qpos(q_current))
@@ -312,16 +288,18 @@ class MinkTracker:
                 pos = np.asarray(pose[0], dtype=np.float64)
                 last = self._last_ee_target[side]
                 if last is not None:
-                    speed = max(speed, float(np.linalg.norm(pos - last))
-                                * cfg.mink_solve_hz)
+                    speed = max(
+                        speed, float(np.linalg.norm(pos - last)) * cfg.mink_solve_hz
+                    )
                 self._last_ee_target[side] = pos
             scale = 1.0 / (1.0 + (speed / cfg.mink_posture_speed_gate) ** 2)
             if cfg.mink_posture_gate_tau > 0.0:
                 if self._gate_scale is None:
                     self._gate_scale = scale
                 else:
-                    alpha = min((1.0 / cfg.mink_solve_hz)
-                                / cfg.mink_posture_gate_tau, 1.0)
+                    alpha = min(
+                        (1.0 / cfg.mink_solve_hz) / cfg.mink_posture_gate_tau, 1.0
+                    )
                     self._gate_scale += alpha * (scale - self._gate_scale)
                 scale = self._gate_scale
             self._posture_task.set_cost(cfg.mink_posture_cost * scale)
@@ -358,9 +336,7 @@ class MinkTracker:
                 # anchors sit ~7 cm off the s1 axis): the true elbow radius
                 # varies ±5 cm with pose, so measure it from the CURRENT
                 # configuration rather than the qpos=0 constant.
-                elbow_now = self._configuration.data.xpos[
-                    self._elbow_bid[side]
-                ]
+                elbow_now = self._configuration.data.xpos[self._elbow_bid[side]]
                 radius = float(np.linalg.norm(elbow_now - center))
                 if radius < 0.05:
                     radius = self._elbow_radius[side]

@@ -159,10 +159,10 @@ class MinkRobotControllerTest(unittest.TestCase):
                     seed, previous if use_previous else np.zeros(14)
                 )
 
-    def test_current_frame_hold_reaches_solver_in_legacy_checkpoint_frame(self):
+    def test_current_frame_hold_reaches_solver_in_model_frame(self):
         from scipy.spatial.transform import Rotation
 
-        fixture = Path(__file__).with_name("data") / "mink_ik_legacy" / "stream.npz"
+        fixture = Path(__file__).with_name("data") / "mink_ik_reference" / "stream.npz"
         with np.load(fixture, allow_pickle=False) as saved:
             joints = saved["fk_joints"][-1].copy()
             positions = saved["fk_positions"][-1].copy()
@@ -173,7 +173,7 @@ class MinkRobotControllerTest(unittest.TestCase):
         quarter_turn = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
         root = np.array([0, 0, 0.86])
         for index, side in enumerate(("left", "right")):
-            # Build generic wire poses independently from recorded legacy FK.
+            # Build generic wire poses independently from recorded model-frame FK.
             position = root + quarter_turn @ (positions[index] - root)
             rotation = Rotation.from_matrix(quarter_turn @ rotations[index]).as_rotvec()
             for axis, value in zip(

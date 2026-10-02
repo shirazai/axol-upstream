@@ -1,28 +1,17 @@
-"""MuJoCo model loading for the Axol URDF.  # shiraz (shirazai/shiraz#210)
+"""Load the bundled Axol Mink model with collision geometry and fixed frames.
 
-MuJoCo's URDF importer needs compiler overrides before the bundled
-``axol.urdf`` loads usefully for kinematics work:
+MuJoCo's URDF importer needs compiler overrides for this model:
 
-- ``strippath``/``meshdir``: mesh references are ``package://`` URIs; MuJoCo
-  must resolve just the basenames against the bundled ``meshes`` directory.
-- ``fusestatic="false"``: the IK end-effector frames (``left/right_gripper``)
-  and the TCP frames (``left/right_hand_tcp``) attach by fixed URDF joints;
-  the default import fuses them into ``*_w2`` / deletes them (see the note
-  in ``almond_axol/constants.py``), which would leave the differential-IK
-  frame tasks nothing to target.
+- ``strippath`` and ``meshdir`` resolve ``package://`` mesh basenames in
+  the bundled ``meshes`` directory.
+- ``fusestatic="false"`` retains fixed-joint gripper and TCP bodies that
+  end-effector tasks need to address by name.
+- ``discardvisual="true"`` removes duplicate visual geometry while
+  retaining collision geometry for Mink collision constraints.
 
-The gravity compensator keeps its own stripped-geometry loader
-(``robot/gravity.py``, visual/collision blocks removed); this loader
-preserves collision geometry so constraint-based consumers (mink's
-``CollisionAvoidanceLimit``) can build geom pairs from it.
-
-xr1-rustcore (shiraz #550, K34): this is the fork-main (80e7a8c)
-``almond_axol/kinematics/mujoco_model.py`` vendored into the XR-1 package
-with ONE change — the default URDF is the pinned fork asset
-(``ik_config.PINNED_URDF``) instead of the vendor tree's ``URDF_PATH``. The
-chemical-speak URDF carries a +90 deg root yaw the checkpoint FK contract
-does not know about (design 5.2); a silently-defaulted load of the vendor
-file would pass every self-consistency test and steer 90 deg off.
+The bundled model uses a separate root-frame convention from Axol world
+poses. Conversion belongs at the interface boundary; all solver geometry
+and forward kinematics use this one model.
 """
 
 from __future__ import annotations
@@ -33,7 +22,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from .ik_config import PINNED_URDF  # xr1-rustcore: K34 (was almond_axol.constants.URDF_PATH)
+from .ik_config import PINNED_URDF
 
 # Injected as the first child of <robot>: MuJoCo reads an embedded <mujoco>
 # extension element from URDF files for compiler settings.
@@ -43,17 +32,16 @@ _COMPILER_TMPL = (
 )
 
 
-def load_mj_model(urdf_path: Path = PINNED_URDF) -> mujoco.MjModel:  # xr1-rustcore: K34 default = pinned asset
-    """Load the Axol URDF as a :class:`mujoco.MjModel` with all frames kept.
+def load_mj_model(urdf_path: Path = PINNED_URDF) -> mujoco.MjModel:
+    """Load an Axol URDF as a :class:`mujoco.MjModel` with fixed frames kept.
 
     Args:
-        urdf_path: URDF file to load; meshes are resolved from the sibling
-            ``meshes`` directory. Defaults to the pinned fork-main asset.
+        urdf_path: URDF file to load. Meshes resolve from the sibling
+            ``meshes`` directory; the default is the bundled Mink model.
 
     Returns:
-        Compiled model with every URDF link preserved as a named body
-        (including the fixed-jointed EE/TCP frames) and collision geoms
-        loaded. Visual-only duplicates are discarded.
+        A compiled model retaining named EE/TCP bodies and collision geometry.
+        Visual-only duplicates are discarded.
     """
     text = urdf_path.read_text(encoding="utf-8")
     inject = _COMPILER_TMPL.format(meshdir=str(urdf_path.parent / "meshes"))

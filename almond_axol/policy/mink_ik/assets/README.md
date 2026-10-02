@@ -1,26 +1,21 @@
-# Pinned Axol URDF (fork main 80e7a8c) — shiraz #550, RUSTCORE_DESIGN.md 5.2
+# Axol Mink model
 
-`axol_fork_80e7a8c.urdf` and `meshes/` are byte-identical copies of
-`almond_axol/kinematics/urdf/axol.urdf` and `almond_axol/kinematics/urdf/meshes/*`
-at fork-main commit `80e7a8c` (`git show 80e7a8c:almond_axol/kinematics/urdf/axol.urdf`).
-`shiraz_axol/tests/test_xr1_rt_ik_verbatim.py` re-checks that identity.
+`axol_mink.urdf` and `meshes/` provide the self-contained model used by the
+Mink solver. The numerical reference fixture records hashes of the URDF and
+every asset, so geometry changes require an explicit reference update.
 
-Why pin instead of loading the vendor tree's URDF:
+The model's root frame differs from the Axol world frame by a 90-degree yaw
+about the root-joint origin at approximately `(0, 0, 0.86)` metres.
+`pose6_world_to_model` converts Cartesian targets at that boundary. The joint
+chains, end-effector frames and collision geometry stay in the model frame
+throughout each solve. Replacing this asset with a world-frame URDF without
+updating the conversion would rotate all targets incorrectly.
 
-- The XR-1 checkpoints were trained on EE poses from `shiraz_axol/xr1/fk.py`
-  (`fk.axol_urdf_bimanual.numpy.v1`: yaw-0 root, EE = the `*_gripper` link
-  origin). The IK must invert THAT FK.
-- The chemical-speak URDF's only kinematic change is a +90 deg yaw on
-  `fixed_node_to_root_joint_0` (arm chain bit-identical, FK to 4.4e-16 after
-  `Rz(+90 deg)` about the 0.86 m root origin). An un-rotated fk.py v1 pose
-  solved against it would be up to 1.119 m off — the hazard this pin removes.
-- The chemical-speak tree also deletes the three `yam_linear4310_*.stl`
-  meshes (+ their LICENSE) and the finger/TCP frames the fork tests target,
-  so the asset directory must be self-contained.
+The bundled meshes include the finger geometry and fixed gripper/TCP frames.
+Mesh references in the URDF use `package://assembly/meshes/<name>.stl`;
+`ik_mujoco_model.load_mj_model` supplies MuJoCo compiler settings that resolve
+these basenames in `assets/meshes` and preserve the fixed frames. The loader
+does not modify the asset on disk.
 
-Mesh references inside the URDF are `package://assembly/meshes/<name>.stl`;
-`ik_mujoco_model.load_mj_model` injects `<compiler strippath="true"
-meshdir=".../assets/meshes">` at load time, exactly as the fork loader does, so
-the URDF text itself stays unmodified.
-
-`meshes/LICENSE-yam_linear4310.txt` covers the three yam meshes (i2rt YAM).
+`meshes/LICENSE-yam_linear4310.txt` contains the attribution and license for
+the three i2rt YAM meshes. Keep it with those assets.

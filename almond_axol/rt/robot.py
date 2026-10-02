@@ -180,8 +180,8 @@ class Axol(RobotBase):
             max_accel: Teleop joint-acceleration cap (rad/s²), same
                 treatment.
             tracking_profile: ``default`` keeps target holdover and overrun
-                smoothing. ``legacy_mink`` selects the XR-1 deployment's
-                literal-target, measured-time tracker and uninterrupted
+                smoothing. ``mink`` selects literal targets,
+                measured-time tracking and uninterrupted
                 command derivatives; all core safety checks remain active.
             record: Teleop flight-recorder prefix. When set, measured
                 position/torque is captured from the core's feedback packets
@@ -244,7 +244,7 @@ class Axol(RobotBase):
         tracking_profile: str,
         record: str | None,
     ) -> None:
-        if tracking_profile not in {"default", "legacy_mink"}:
+        if tracking_profile not in {"default", "mink"}:
             raise ValueError(f"Unknown realtime tracking profile: {tracking_profile!r}")
         self._tracking_profile = tracking_profile
         self._robot = hardware

@@ -1,4 +1,4 @@
-"""Validate current-world FK against independent frozen legacy FK samples."""
+"""Validate current-world FK against independent frozen model-frame FK samples."""
 
 from pathlib import Path
 
@@ -13,11 +13,11 @@ from almond_axol.kinematics.mujoco_fk import (
 
 @pytest.fixture(scope="module")
 def samples():
-    with np.load(Path(__file__).parent / "data/mink_ik_legacy/stream.npz") as source:
+    with np.load(Path(__file__).parent / "data/mink_ik_reference/stream.npz") as source:
         yield {name: source[name] for name in source.files}
 
 
-def test_current_world_fk_matches_independent_legacy_samples(samples):
+def test_current_world_fk_matches_independent_reference_samples(samples):
     fk = AxolForwardKinematics()
     # The current URDF adds +90 degrees about the translated root origin.
     rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
@@ -29,15 +29,15 @@ def test_current_world_fk_matches_independent_legacy_samples(samples):
         strict=True,
     ):
         poses = fk.ee_poses(joints[:7], joints[7:])
-        for pose, legacy_position, legacy_rotation in zip(
+        for pose, model_position, model_rotation in zip(
             poses, positions, rotations, strict=True
         ):
             position, actual_rotation = pose6_to_pos_rot(pose)
             np.testing.assert_allclose(
-                position, origin + rotation @ (legacy_position - origin), atol=3e-7
+                position, origin + rotation @ (model_position - origin), atol=3e-7
             )
             np.testing.assert_allclose(
-                actual_rotation, rotation @ legacy_rotation, atol=1e-6
+                actual_rotation, rotation @ model_rotation, atol=1e-6
             )
             assert pose.shape == (6,)
             assert pose.dtype == np.float32

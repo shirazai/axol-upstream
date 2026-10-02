@@ -31,18 +31,18 @@ class TrackingProfileTest(TestCase):
 
     def test_explicit_profile_is_the_only_wire_change(self):
         default = Axol._wrap(_hardware())._config_text()
-        legacy = Axol._wrap(_hardware(), tracking_profile="legacy_mink")._config_text()
+        mink = Axol._wrap(_hardware(), tracking_profile="mink")._config_text()
         self.assertNotIn("tracking_profile", default)
-        self.assertEqual(legacy.count("tracking_profile legacy_mink\n"), 1)
-        self.assertEqual(legacy.replace("tracking_profile legacy_mink\n", ""), default)
+        self.assertEqual(mink.count("tracking_profile mink\n"), 1)
+        self.assertEqual(mink.replace("tracking_profile mink\n", ""), default)
 
     def test_public_constructor_forwards_profile_without_starting_hardware(self):
         with patch("almond_axol.rt.robot.AxolHardware", return_value=_hardware()):
-            robot = Axol(tracking_profile="legacy_mink")
-        self.assertIn("tracking_profile legacy_mink\n", robot._config_text())
+            robot = Axol(tracking_profile="mink")
+        self.assertIn("tracking_profile mink\n", robot._config_text())
         self.assertFalse(robot._armed)
         self.assertFalse(robot._core_started)
 
     def test_unknown_profile_is_rejected_before_runtime_start(self):
         with self.assertRaisesRegex(ValueError, "Unknown realtime tracking profile"):
-            Axol._wrap(_hardware(), tracking_profile="legcy_mink")
+            Axol._wrap(_hardware(), tracking_profile="invalid_profile")

@@ -1,16 +1,16 @@
-"""Regenerate the hardware-free XR-1 tracker fixture using the frozen Rust source.
+"""Regenerate the Mink tracking fixture from standalone reference equations.
 
-Run from any directory. Requires the provenance commit in this checkout and rustc;
-it compiles only filter.rs into a temporary executable, never a CAN service.
+Run from any directory with Python and rustc. The checked-in scalar reference
+is independent of the runtime filters and tracking profile. This compiles only
+a temporary numerical executable and never starts a CAN service.
 """
 
 import subprocess
 import tempfile
 from pathlib import Path
 
-REVISION = "b32002c0507db5ab03a421c9fb1f2ebf4b7fd49b"
 ROOT = Path(__file__).resolve().parents[3]
-OUTPUT = ROOT / "rust/axol-rt/tests/data/legacy_mink_tracking.csv"
+OUTPUT = ROOT / "rust/axol-rt/tests/data/mink_tracking.csv"
 DRIVER = r"""
 mod filter;
 use filter::{BandPass, LpDiff, Trapezoid};
@@ -31,8 +31,8 @@ fn main() {
         if adopt { target = 0.2 * (tick as f64 * 0.07).sin(); }
         let overrun = tick == 112 || tick == 136;
         let dt = match tick { 0 => 0.0, 112 => 0.025, 136 => 0.015, _ => 1.0 / 240.0 };
-        // Exact b320 serve.rs tracked command branch: latest literal target,
-        // measured dt, uninterrupted low-pass derivatives, timing-gated BP.
+        // Literal target, measured dt, uninterrupted low-pass derivatives,
+        // and timing-gated band-pass damping define the reference profile.
         let (position, _, _) = tracker.update(target, dt);
         let velocity = vel.update(position, dt);
         let acceleration = acc.update(velocity, dt);
@@ -52,10 +52,8 @@ fn main() {
 
 
 def main() -> None:
-    source = subprocess.check_output(
-        ["git", "show", f"{REVISION}:rust/axol-rt/src/filter.rs"], cwd=ROOT
-    )
-    with tempfile.TemporaryDirectory(prefix="axol-legacy-filter-") as directory:
+    source = Path(__file__).with_name("gen_mink_reference.rs").read_bytes()
+    with tempfile.TemporaryDirectory(prefix="axol-mink-reference-") as directory:
         work = Path(directory)
         (work / "filter.rs").write_bytes(source)
         (work / "main.rs").write_text(DRIVER)
@@ -74,7 +72,7 @@ def main() -> None:
         trace = subprocess.check_output([str(executable)])
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_bytes(
-        f"# Source: Axol {REVISION}; regenerate: tools/gen_legacy_mink_trace.py\n".encode()
+        b"# Reference: tools/gen_mink_reference.rs; regenerate: tools/gen_mink_trace.py\n"
         + trace
     )
     print(OUTPUT)

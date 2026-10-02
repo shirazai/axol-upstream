@@ -29,7 +29,7 @@ Install optional dependency groups as needed (the hosted installer defaults to `
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `jax` | JAX, jaxlie, almond-pyroki / almond-jaxls | Default IK and legacy planning commands |
+| `jax` | JAX, jaxlie, almond-pyroki / almond-jaxls | Default JAX IK and planning commands |
 | `mink` | Pinned Mink, MuJoCo, and DAQP | Mink IK and reset/return planning without JAX |
 | `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
@@ -39,7 +39,7 @@ uv sync --extra jax --extra lerobot --extra sim   # hosted default
 uv sync --extra mink --extra lerobot --extra sim # Mink-only collection/policy
 ```
 
-The backend is selected separately in session configuration. For teleop, set `kinematics.backend="mink"`. For collection and DAgger, set both `teleop_config.kinematics_config.backend="mink"` and `robot_config.cartesian_controller="mink"`. Policy execution selects `robot_config.cartesian_controller="mink"`. See [Mink kinematics](/operations/mink) for complete configurations. Install the `jax` extra when using the default JAX configuration. Both extras can be installed together for development.
+The backend is selected separately in session configuration. For teleop, set `kinematics.backend="mink"`. For collection and DAgger, set both `teleop_config.kinematics_config.backend="mink"` and `robot_config.cartesian_controller="mink"`. Policy execution selects `robot_config.cartesian_controller="mink"`. See [Mink IK](/operations/mink) for complete configurations. Install the `jax` extra when using the default JAX configuration. Both extras can be installed together for development.
 
 The hosted installer accepts `AXOL_KINEMATICS=mink` (`curl -fsS https://axol.almond.bot/install | AXOL_KINEMATICS=mink bash`), and hosted updates preserve the installed backends. `axol provision` installs system and device dependencies without selecting a kinematics backend.
 

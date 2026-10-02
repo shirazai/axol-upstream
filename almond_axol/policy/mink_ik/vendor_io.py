@@ -1,8 +1,8 @@
-"""Only the exact legacy Rodrigues conversion required by the Mink solver.
+"""Rodrigues axis-angle conversion used by Mink IK.
 
-Copied from shiraz_axol/xr1/vendor_io.py at
-b32002c0507db5ab03a421c9fb1f2ebf4b7fd49b, originally XR-1's
-mibot/utils/io.py:125-132. Preserve float32 coercion and operation order.
+Preserve float32 coercion and expression order for reproducible pose decoding.
+Third-party attribution and license are retained in the adjacent NOTICE and
+LICENSE files.
 """
 
 import numpy as np

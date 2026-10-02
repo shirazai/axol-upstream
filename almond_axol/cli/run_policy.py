@@ -209,7 +209,7 @@ class RunPolicyConfig:
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
     reset_torque_threshold: float = 6.0
-    # Hard modeled clearance for the JAX-free Mink reset planner (metres).
+    # Hard modeled clearance for the Mink reset planner (metres).
     mink_reset_collision_margin: float = 0.01
     # Optional deployment rest goals, in radians (seven arm joints per side).
     # Omitted sides retain the generic teleoperation rest configuration.

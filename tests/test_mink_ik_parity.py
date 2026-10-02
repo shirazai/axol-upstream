@@ -1,9 +1,9 @@
-"""Real Mink stream/FK parity against recorded legacy solver output.
+"""Real Mink stream/FK parity against recorded reference solver output.
 
-The fixture was generated from the independent legacy source by
-tests/tools/mink_ik_legacy_parity.py. These tests need no user cache, robot,
+The fixture was generated from the independent reference source by
+tests/tools/mink_ik_reference.py. These tests need no user cache, robot,
 camera, or JAX runtime. Source/asset hashes prevent a self-consistent model
-change from silently changing the checkpoint's coordinate frame.
+change from silently changing the model's coordinate frame.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import pytest
 
 from almond_axol.policy import mink_ik
 from almond_axol.policy.mink_ik import MinkIK, MinkIKConfig, pose6_to_pos_rot_np
-from tests.tools.mink_ik_legacy_parity import (
+from tests.tools.mink_ik_reference import (
     COMMITTED_FIXTURES,
     load_fixture,
     runtime_platform,
@@ -34,7 +34,7 @@ FIXTURES = COMMITTED_FIXTURES
 
 @pytest.fixture(scope="module")
 def golden():
-    native = os.environ.get("AXOL_MINK_LEGACY_FIXTURE")
+    native = os.environ.get("AXOL_MINK_REFERENCE_FIXTURE")
     arrays, metadata = load_fixture(
         Path(native) if native else FIXTURES, require_native=bool(native)
     )
@@ -42,8 +42,8 @@ def golden():
         pytest.fail(
             "The committed Mink expectations were generated on "
             f"{metadata['runtime_platform']}. Generate a native fixture with "
-            "tests/tools/mink_ik_legacy_parity.py --replay-fixture and set "
-            "AXOL_MINK_LEGACY_FIXTURE to its directory; see mink_ik/PROVENANCE.md."
+            "tests/tools/mink_ik_reference.py --replay-fixture and set "
+            "AXOL_MINK_REFERENCE_FIXTURE to its directory; see mink_ik/PROVENANCE.md."
         )
     return arrays
 
@@ -53,28 +53,24 @@ def provenance():
     return json.loads((FIXTURES / "provenance.json").read_text())
 
 
-def test_fixture_and_copied_solver_assets_match_legacy_provenance(provenance):
-    assert provenance["legacy_commit"] == "b32002c0507db5ab03a421c9fb1f2ebf4b7fd49b"
+def test_fixture_and_copied_solver_assets_match_reference_provenance(provenance):
+    assert provenance["reference_commit"] == "b32002c0507db5ab03a421c9fb1f2ebf4b7fd49b"
     assert (
         hashlib.sha256((FIXTURES / "stream.npz").read_bytes()).hexdigest()
         == provenance["fixture_sha256"]
     )
     package = Path(mink_ik.__file__).parent
-    for name, digest in provenance["source_sha256"].items():
-        # vendor_io is a single exact function extracted from the legacy
-        # inference helper module; FK expectations come from independent fk.py.
-        if name in {"vendor_io.py", "fk.py"}:
-            continue
+    for name, digest in provenance["production_source_sha256"].items():
         assert hashlib.sha256((package / name).read_bytes()).hexdigest() == digest, name
 
 
-def test_serving_config_and_numerical_runtime_match_legacy(provenance):
+def test_solver_config_and_numerical_runtime_match_reference(provenance):
     assert asdict(MinkIKConfig()) == provenance["config"]
     assert mujoco.__version__ == "3.11.0"
     assert importlib.metadata.version("mink") == "1.2.0"
 
 
-def test_real_solver_matches_legacy_stream_far_targets_and_reset_exactly(golden):
+def test_real_solver_matches_reference_stream_far_targets_and_reset_exactly(golden):
     solver = MinkIK()
     rest = golden["rest14"]
     solver.set_rest_posture(rest)
@@ -98,7 +94,36 @@ def test_real_solver_matches_legacy_stream_far_targets_and_reset_exactly(golden)
         assert np.max(np.abs(joints - previous)) <= solver.per_call_step_bound + 1e-7
 
 
-def test_native_model_fk_matches_independent_checkpoint_frame(golden):
+def test_world_frame_stream_matches_independent_reference_exactly(golden):
+    from almond_axol.policy.mink_ik import pose6_world_to_model
+
+    solver = MinkIK()
+    rest = golden["rest14"]
+    solver.set_rest_posture(rest)
+    solver.reset_tracking_state()
+    joints = rest.copy()
+    for tick, poses in enumerate(golden["current_wire_pose6"]):
+        if golden["reset_before"][tick]:
+            joints = rest.copy()
+            solver.reset_tracking_state()
+        targets = [pose6_world_to_model(pose) for pose in poses]
+        for side, (position, rotation) in enumerate(targets):
+            np.testing.assert_array_equal(
+                position, golden["current_wire_positions"][tick, side]
+            )
+            np.testing.assert_array_equal(
+                rotation, golden["current_wire_rotations"][tick, side]
+            )
+        joints = solver.solve(joints, *targets)
+        np.testing.assert_array_equal(
+            joints,
+            golden["current_wire_joints"][tick],
+            err_msg=f"world-frame tick {tick}",
+        )
+    assert solver.fail_count == 0
+
+
+def test_native_model_fk_matches_independent_model_frame(golden):
     solver = MinkIK()
     assert solver.model.nq == 18
     assert solver.tracker._model is solver.model
@@ -121,7 +146,7 @@ def test_native_model_fk_matches_independent_checkpoint_frame(golden):
             )
 
 
-def test_pose_conversion_matches_legacy_at_zero_pi_and_seeded_rotations(golden):
+def test_pose_conversion_matches_reference_at_zero_pi_and_seeded_rotations(golden):
     for sample, pose in enumerate(golden["pose6"]):
         position, rotation = pose6_to_pos_rot_np(pose)
         np.testing.assert_array_equal(position, golden["pose_positions"][sample])
@@ -133,7 +158,7 @@ def test_pose_conversion_matches_legacy_at_zero_pi_and_seeded_rotations(golden):
 def test_alternate_model_is_rejected_before_construction(tmp_path):
     other = tmp_path / "different-model.urdf"
     other.write_text(mink_ik.PINNED_URDF.read_text())
-    with pytest.raises(ValueError, match="pinned fork URDF only"):
+    with pytest.raises(ValueError, match="requires the bundled model"):
         MinkIK(urdf_path=other)
 
 

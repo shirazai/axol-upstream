@@ -37,7 +37,7 @@ dependencies = [
 # The standard backend remains available explicitly; Mink-only installs do
 # not install JAX, jaxlie, pyroki, or their JAXLS dependency.
 jax = ["jax>=0.9.2,<0.10", "jaxlie>=1.5.0,<2", "almond-pyroki>=0.1.0,<0.2"]
-# Pinned numerical stack of the deployed Mink controller. MuJoCo changes
+# Pinned numerical stack of the Mink controller. MuJoCo changes
 # collision rows between releases even with identical solver code.
 mink = ["mink==1.2.0", "mujoco==3.11.0", "qpsolvers==4.13.0", "daqp==0.8.7"]
 gamepad = ["pygame>=2.6,<3"]
@@ -117,13 +117,4 @@ fail_under = 30
 exclude_also = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
-]
-
-[tool.ruff]
-# These files are frozen numerical implementations with source-hash tests.
-extend-exclude = [
-    "almond_axol/policy/mink_ik/ik.py",
-    "almond_axol/policy/mink_ik/ik_config.py",
-    "almond_axol/policy/mink_ik/ik_mink_backend.py",
-    "almond_axol/policy/mink_ik/ik_mujoco_model.py",
 ]

@@ -1,11 +1,12 @@
 ---
-title: "Mink kinematics"
-description: "Run teleoperation, collection and custom policies without JAX."
+title: "Mink IK"
+description: "Run teleoperation, collection and custom policies with Mink IK."
 ---
 
 Mink uses MuJoCo and a velocity QP for arm kinematics. A Mink session uses this
 backend for tracking, forward kinematics, startup homing, episode returns and
-shutdown parking. JAX and Pyroki are optional dependencies of the legacy backend.
+shutdown parking. The existing JAX/Pyroki backend remains the default and can be
+installed independently.
 
 ## Install and select
 
@@ -19,7 +20,7 @@ Run commands through the activated environment or `uv run --no-sync axol …` so
 the installed optional dependencies are retained.
 
 For a package installation, use `almond-axol[mink,lerobot,sim]`. Omit `sim` when a
-browser simulator is unnecessary. The legacy controller is available through the
+browser simulator is unnecessary. The JAX controller is available through the
 `jax` extra. Backend selection is explicit; installing an extra does not change
 saved settings or the default backend.
 
@@ -34,7 +35,7 @@ dataset settings):
 | `run-policy` | `robot_config.cartesian_controller: "mink"`, `robot_config.action_space: "cartesian"` |
 
 The robot selector also selects MuJoCo forward kinematics and the Rust
-`legacy_mink` execution profile when commands are already in joint space.
+`mink` execution profile when commands are already in joint space.
 `observe_cartesian` selects observation representation independently of the
 action representation. Elbow hints must be disabled (`elbow_weight: 0`, the
 default) for the Mink tracking profile. Remote DAgger rejects mismatched policy
@@ -81,13 +82,13 @@ command. Remote DAgger can instead retain joint training actions with
 ## Execution and coordinate frames
 
 Public Cartesian actions and observations use the current Axol world frame and
-gripper-link pose convention. The frozen tracking solver internally uses its
-original model frame; the adapter converts only that boundary. Model assets,
+gripper-link pose convention. The tracking solver internally uses the bundled
+model frame; the adapter converts only that boundary. Model assets,
 dependency versions and numerical fixtures are recorded in
 `almond_axol/policy/mink_ik/PROVENANCE.md`.
 
 Mink policy outputs go directly to the Rust tracker without the additional Python
-joint shaper used by JAX Cartesian execution. `legacy_mink` tracks literal targets,
+joint shaper used by JAX Cartesian execution. `mink` tracks literal targets,
 uses measured time across overruns and preserves command derivatives. It retains
 the realtime core's watchdog and command validation. Changing backend therefore
 changes tracking semantics, not just solver speed.
@@ -106,7 +107,7 @@ frame, control rates, request interval, rest poses, gains, gripper torque limits
 and contact thresholds. Upstream defaults are not a deployment profile; in
 particular, the default request interval is five ticks and the default reset
 contact threshold is 6 Nm. The example above explicitly selects ten ticks and
-4 Nm. Checkpoint-specific gain overrides remain session configuration.
+4 Nm. Policy-specific gain overrides remain session configuration.
 
 ## Reset and parking design
 
@@ -139,24 +140,24 @@ their existing cleanup path.
 
 `vr_teleop_config.mink_reset_collision_margin` (or the top-level
 `mink_reset_collision_margin` in `run-policy`) selects the Mink planner's hard
-clearance target (default 0.01 m). The legacy `reset_collision_margin` and reset
+clearance target (default 0.01 m). The JAX `reset_collision_margin` and reset
 penalty weights configure the JAX planner's soft costs and do not configure
 Mink. Pairs close in the known home pose use home-relative limits. A start inside
 the nominal clearance buffer must recover clearance without moving deeper into
 it; a colliding start or blocked path is rejected.
 
-This deliberately replaces the legacy JAX joint-space reset trajectory. Frozen
-tracking parity does not imply identical reset trajectories or physical behavior.
+Selecting Mink uses Cartesian reset paths instead of the JAX joint-space planner.
+Tracking parity does not imply identical reset trajectories or physical behavior.
 
 ## Validation and deployment
 
 The test suite covers independent frozen solver outputs, public-frame FK,
 Rust filter vectors, constrained reset planning, backend propagation and
 dispatch ownership. The Mink-only CI job installs no JAX-family packages and
-exercises imports and the lifecycle paths in that environment. The legacy JAX
+exercises imports and the lifecycle paths in that environment. The JAX
 backend has separate coverage in the complete test environment.
 
 Hardware acceptance must cover single/two-arm collection, DAgger takeover and
 handback, remote Cartesian execution, blocked/interrupted resets, and rest-to-zero
-parking. A resident demo can reuse the robot, shared-camera, recording and policy
-lifecycle APIs; its application-level prompt/capture orchestration is separate.
+parking. Resident sessions can reuse the robot, shared-camera, recording and policy
+lifecycle APIs.

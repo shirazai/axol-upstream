@@ -1,9 +1,9 @@
-"""Teleop interface to the same pinned Mink tracker as Cartesian policies.
+"""Teleop interface to the Mink tracker used by Cartesian policies.
 
-Public poses use the current Axol world frame (FLU). The wrapped solver owns
-the legacy model and its tuning; only the root-frame boundary, active-arm
-constraints and teleop's public method names are adapted here. Joint vectors
-remain left then right, seven arm joints each, without grippers.
+Public poses use the Axol world frame (FLU). This adapter converts poses
+to the bundled model frame, freezes inactive arms and exposes the teleop
+kinematics interface. Joint vectors contain seven arm joints per side,
+left followed by right, without grippers.
 """
 
 from __future__ import annotations
@@ -17,17 +17,17 @@ import numpy as np
 
 from ..constants import Joint, urdf_body_name
 from ..policy.mink_ik import MinkIK, MinkIKConfig
-from ..policy.mink_ik.frames import _CURRENT_TO_LEGACY_R, _ROOT_ORIGIN
+from ..policy.mink_ik.frames import _ROOT_ORIGIN, _WORLD_TO_MODEL_R
 from .config import KinematicsConfig
 
 Pose = tuple[np.ndarray, np.ndarray]
 
 
-def _current_position(position: np.ndarray) -> np.ndarray:
-    return _ROOT_ORIGIN + _CURRENT_TO_LEGACY_R.T @ (position - _ROOT_ORIGIN)
+def _world_position(position: np.ndarray) -> np.ndarray:
+    return _ROOT_ORIGIN + _WORLD_TO_MODEL_R.T @ (position - _ROOT_ORIGIN)
 
 
-def _legacy_pose(pose: Pose | None) -> Pose | None:
+def _model_pose(pose: Pose | None) -> Pose | None:
     if pose is None:
         return None
     position, rotation = (np.asarray(value, dtype=np.float64) for value in pose)
@@ -39,10 +39,10 @@ def _legacy_pose(pose: Pose | None) -> Pose | None:
     ):
         raise ValueError("Mink targets must be finite (position[3], rotation[3,3])")
     return (
-        (_ROOT_ORIGIN + _CURRENT_TO_LEGACY_R @ (position - _ROOT_ORIGIN)).astype(
+        (_ROOT_ORIGIN + _WORLD_TO_MODEL_R @ (position - _ROOT_ORIGIN)).astype(
             np.float32
         ),
-        (_CURRENT_TO_LEGACY_R @ rotation).astype(np.float32),
+        (_WORLD_TO_MODEL_R @ rotation).astype(np.float32),
     )
 
 
@@ -134,15 +134,15 @@ class MinkKinematicsSolver:
     @property
     def shoulder_positions(self) -> dict[str, np.ndarray]:
         return {
-            side: _current_position(position).astype(np.float32)
+            side: _world_position(position).astype(np.float32)
             for side, position in self._ik.shoulder_positions.items()
         }
 
     def fk(self, q: np.ndarray) -> tuple[Pose, Pose]:
         poses = tuple(
             (
-                _current_position(position).astype(np.float32),
-                (_CURRENT_TO_LEGACY_R.T @ rotation).astype(np.float32),
+                _world_position(position).astype(np.float32),
+                (_WORLD_TO_MODEL_R.T @ rotation).astype(np.float32),
             )
             for position, rotation in self._ik.fk(self._q(q))
         )
@@ -154,7 +154,7 @@ class MinkKinematicsSolver:
         data.qpos[self._qpos_indices] = self._q(q)
         mujoco.mj_kinematics(self._ik.model, data)
         positions = [
-            _current_position(data.xpos[body]).astype(np.float32)
+            _world_position(data.xpos[body]).astype(np.float32)
             for body in self._elbow_ids
         ]
         return positions[0], positions[1]
@@ -170,7 +170,7 @@ class MinkKinematicsSolver:
         *,
         active_sides: Collection[str] | None = None,
     ) -> np.ndarray:
-        """Solve current-frame targets, keeping inactive arms bitwise fixed.
+        """Solve world-frame targets while keeping inactive arms bitwise fixed.
 
         The QP retains its fixed per-call safety budget when ``delta_scale``
         exceeds one; a delayed VR frame cannot enlarge the policy-compatible
@@ -193,8 +193,8 @@ class MinkKinematicsSolver:
         try:
             result = self._ik.solve(
                 q,
-                _legacy_pose(left_pose) if "left" in active else None,
-                _legacy_pose(right_pose) if "right" in active else None,
+                _model_pose(left_pose) if "left" in active else None,
+                _model_pose(right_pose) if "right" in active else None,
             )
         finally:
             tracker._constraints = previous_constraints

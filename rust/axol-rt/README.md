@@ -225,29 +225,28 @@ Guarded return stays on the same core: `torque_residuals` and
 streams its tuples through the same command sink — the contact watchdog,
 the limp contact hold, and the replanned reset all run against the core.
 
-### XR-1 Mink tracking profile
+### Mink tracking profile
 
-`Axol(tracking_profile="legacy_mink")` emits the strict optional config line
-`tracking_profile legacy_mink`. This restores the tracking equations used by
-XR-1 at Axol commit `b32002c0507db5ab03a421c9fb1f2ebf4b7fd49b`:
-the last received joint target goes directly to the Rust trapezoid, its step
-uses measured tick spacing, and command velocity/acceleration derivatives
-continue across overruns. Target holdover and the default profile's overrun
-derivative re-seeding are disabled. Mink supplies joints without a Python
-trapezoid ahead of this core.
+`Axol(tracking_profile="mink")` emits the strict optional config line
+`tracking_profile mink`. The last received joint target goes directly to the
+Rust trapezoid, each step uses measured tick spacing, and command
+velocity/acceleration derivatives continue across overruns. Target holdover
+and the default profile's overrun derivative re-seeding are disabled. Mink
+supplies joint targets without a Python trapezoid ahead of this core.
 
-Current target validation, watchdog, timing/feedback health gates, and fault
-handling still apply. This profile restores the historical tracker and
-feedforward math; it does not restore old fault behavior or change configured
-joint gains. The default omits the directive and retains current behavior.
-An older binary rejects the unknown directive during configuration, before
-CAN preparation; rebuild the core together with the Python package.
+Both profiles use the same target validation, watchdog, timing/feedback health
+gates, and fault handling. Selecting Mink does not change configured joint
+gains. Omitting the directive retains the default profile. A binary that does
+not support the directive rejects it during configuration, before CAN
+preparation; rebuild the core together with the Python package.
 
-`cargo test legacy_mink_matches_frozen_deployment_trace` checks all samples of
-a fixture generated from that commit's original Rust filters and command
-equations, including 30 Hz policy targets, 240 Hz rest targets, transitions,
-target gaps, and core overruns. Regenerate it with
-`python tools/gen_legacy_mink_trace.py` (CPU only; no CAN access).
+`cargo test mink_matches_reference_trace` checks all samples of an independent
+reference trace, including 30 Hz joint targets, 240 Hz reset targets, cadence
+transitions, target gaps, and core overruns. Regenerate it with
+`python tools/gen_mink_trace.py` (CPU only; no CAN access). The generator
+compiles the checked-in scalar equations in `tools/gen_mink_reference.rs`,
+which are independent of the runtime filters and profile selection. It needs
+only Python and `rustc`; no repository history or external checkout is needed.
 
 ### Control-term tracing
 

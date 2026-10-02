@@ -1,4 +1,4 @@
-"""Native parity fixtures must remain bound to the independent legacy baseline."""
+"""Native parity fixtures must remain bound to the independent reference baseline."""
 
 import hashlib
 import json
@@ -7,7 +7,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from tests.tools.mink_ik_legacy_parity import (
+from tests.tools.mink_ik_reference import (
     COMMITTED_FIXTURES,
     load_fixture,
     load_reference,
@@ -43,10 +43,12 @@ def test_native_fixture_accepts_exact_inputs_and_matching_provenance(native_fixt
 @pytest.mark.parametrize(
     ("field", "changed", "message"),
     [
-        ("legacy_commit", "0" * 40, "legacy commit"),
+        ("reference_commit", "0" * 40, "reference commit"),
         ("fixture_sha256", "0" * 64, "archive hash"),
         ("input_fixture_sha256", "0" * 64, "committed inputs"),
         ("source_sha256", {}, "source_sha256"),
+        ("production_source_sha256", {}, "production_source_sha256"),
+        ("reference_archive_sha256", "0" * 64, "reference_archive_sha256"),
         ("config", {}, "config"),
         ("stream", {}, "stream"),
         ("runtime_versions", {}, "runtime_versions"),
@@ -64,7 +66,9 @@ def test_native_fixture_rejects_provenance_drift(
         load_fixture(native_fixture, require_native=True)
 
 
-@pytest.mark.parametrize("changed_input", ["left_pos", "reset_before", "fk_joints"])
+@pytest.mark.parametrize(
+    "changed_input", ["left_pos", "reset_before", "fk_joints", "current_wire_pose6"]
+)
 def test_native_fixture_rejects_changed_inputs_even_with_valid_hash(
     native_fixture, changed_input
 ):
@@ -86,16 +90,14 @@ def test_native_fixture_rejects_changed_input_dtype(native_fixture):
         load_fixture(native_fixture, require_native=True)
 
 
-def test_legacy_sources_are_verified_before_import(tmp_path):
+def test_reference_sources_are_verified_before_import(tmp_path):
     _, metadata = load_fixture(COMMITTED_FIXTURES)
     for name in metadata["source_sha256"]:
         source = tmp_path / name
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text("raise AssertionError('must not import unverified source')\n")
     with (
-        patch(
-            "tests.tools.mink_ik_legacy_parity.importlib.import_module"
-        ) as import_module,
+        patch("tests.tools.mink_ik_reference.importlib.import_module") as import_module,
         pytest.raises(ValueError, match="source/assets differ"),
     ):
         load_reference(tmp_path)

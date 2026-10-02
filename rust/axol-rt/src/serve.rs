@@ -880,7 +880,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                 // Optional and strict: a pre-profile core rejects this line
                 // rather than silently running different control physics.
                 tracking_profile = match f.as_slice() {
-                    ["tracking_profile", "legacy_mink"] => TrackingProfile::LegacyMink,
+                    ["tracking_profile", "mink"] => TrackingProfile::Mink,
                     _ => return Err(bad(line)),
                 };
             }
@@ -1439,18 +1439,18 @@ mod tests {
             TrackingProfile::Default
         );
         assert_eq!(
-            parse_config(&format!("{base}tracking_profile legacy_mink\n"))
+            parse_config(&format!("{base}tracking_profile mink\n"))
                 .unwrap()
                 .tracking_profile,
-            TrackingProfile::LegacyMink,
+            TrackingProfile::Mink,
         );
         for line in [
             "tracking_profile",
-            "tracking_profile legacy_mink extra",
+            "tracking_profile mink extra",
             "tracking_profile future",
             // Existing binaries fail the same strict unknown-directive gate
             // on `tracking_profile`; unknown semantics must never be ignored.
-            "future_tracking_profile legacy_mink",
+            "future_tracking_profile mink",
         ] {
             assert!(parse_config(&format!("{base}{line}\n")).is_err(), "{line}");
         }

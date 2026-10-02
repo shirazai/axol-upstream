@@ -24,7 +24,7 @@ def solver():
 
 @pytest.fixture(scope="module")
 def saved():
-    path = Path(__file__).with_name("data") / "mink_ik_legacy" / "stream.npz"
+    path = Path(__file__).with_name("data") / "mink_ik_reference" / "stream.npz"
     with np.load(path, allow_pickle=False) as values:
         return {key: values[key].copy() for key in values.files}
 
@@ -63,18 +63,18 @@ def test_two_arm_tracking_matches_policy_solver_with_same_frame_inputs(solver, s
     quarter_turn = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
     root = np.array([-2.77556e-17, -6.93889e-18, 0.86])
     for tick in range(24):
-        targets, legacy = [], []
+        targets, model_frame = [], []
         for side in ("left", "right"):
             position = root + quarter_turn @ (saved[f"{side}_pos"][tick] - root)
             rotation = quarter_turn @ saved[f"{side}_rot"][tick]
             targets.append((position, rotation))
-            legacy.append(
+            model_frame.append(
                 (
                     (root + quarter_turn.T @ (position - root)).astype(np.float32),
                     (quarter_turn.T @ rotation).astype(np.float32),
                 )
             )
-        expected = reference.solve(q, *legacy)
+        expected = reference.solve(q, *model_frame)
         q = solver.ik(q, *targets)
         np.testing.assert_array_equal(q, expected, err_msg=f"tick {tick}")
 
