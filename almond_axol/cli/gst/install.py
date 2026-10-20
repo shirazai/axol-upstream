@@ -5,11 +5,13 @@ Install the host-side GStreamer support the unified ZED camera pipeline needs
 (``teleop --cameras`` / ``collect-data``): the GStreamer introspection typelibs
 and **PyGObject**, so the in-process pipeline (:mod:`almond_axol.video.gst_zed`)
 can pull headset access units from ``appsink`` and carry dataset access units
-with their sensor PTS through GDP/shared memory. The NVENC encoder
-(``nvv4l2h264enc`` / ``nvvidconv``) ships with the Jetson L4T BSP, and the
-patched zed-gstreamer source elements (``zedxonesrc`` / ``zedsrc``) are built
-separately by ``axol gst.build-zed`` — this command only verifies those are
-present.
+with their sensor PTS through GDP/shared memory. The NVENC elements
+(``nvv4l2h264enc`` / ``nvvidconv``) come from the L4T BSP's
+``nvidia-l4t-gstreamer`` package, which a minimal flash leaves out (e.g. an AGX
+Thor on L4T 39.2), so this command installs it too — pinned to the running
+BSP release (see :func:`_l4t_gstreamer_apt_spec`). The patched zed-gstreamer
+source elements (``zedxonesrc`` / ``zedsrc``) are built separately by
+``axol gst.build-zed``; this command only reports whether they are present.
 
 PyGObject is not a usable PyPI wheel — it builds against the system
 gobject-introspection and loads the system typelibs — so it can't be a normal
@@ -46,7 +48,7 @@ _logger = logging.getLogger(__name__)
 _PYGOBJECT_SPEC = "pygobject>=3.50,<3.52"
 
 # GStreamer elements gst.install is itself responsible for verifying: the NVENC
-# encode path (nvvidconv / nvv4l2h264enc), which ships with the Jetson L4T BSP,
+# encode path (nvvidconv / nvv4l2h264enc, from the BSP's nvidia-l4t-gstreamer),
 # plus videorate (plugins-base) and GDP payloading (plugins-bad).
 # ``gdppay``/``gdpdepay`` preserve sensor-exposure PTS across the dataset
 # recorder's shm boundary.
@@ -78,6 +80,14 @@ _APT_PACKAGES = (
     "libcairo2-dev",
     "pkg-config",
 )
+
+# The L4T BSP package carrying the NVENC GStreamer plugins (nvvidconv,
+# nvv4l2h264enc, nvarguscamerasrc, ...). Present on a full JetPack image, absent
+# on a minimal flash. The name is the same on every JetPack release.
+_L4T_GSTREAMER_PACKAGE = "nvidia-l4t-gstreamer"
+# The BSP package every flashed Jetson has; its installed version is the
+# running L4T release (e.g. ``39.2.0-20260601141651``).
+_L4T_CORE_PACKAGE = "nvidia-l4t-core"
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -165,11 +175,66 @@ def _note_zed_sources() -> None:
         )
 
 
+def _installed_l4t_core_version() -> str | None:
+    """Version of the installed ``nvidia-l4t-core`` package, if any.
+
+    Only dpkg's *installed* state counts (a removed-but-configured package still
+    answers with its old version).
+    """
+    dpkg_query = shutil.which("dpkg-query")
+    if dpkg_query is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                dpkg_query,
+                "-W",
+                "-f",
+                "${db:Status-Status} ${Version}",
+                _L4T_CORE_PACKAGE,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:  # noqa: BLE001 - dpkg missing / timed out
+        return None
+    parts = proc.stdout.split()
+    if proc.returncode != 0 or len(parts) != 2 or parts[0] != "installed":
+        return None
+    return parts[1]
+
+
+def _l4t_gstreamer_apt_spec() -> str:
+    """``nvidia-l4t-gstreamer`` pinned to the running BSP release.
+
+    NVIDIA's apt repository for an L4T line (``r39.2``) carries later point
+    releases too (39.2.1 next to the flashed 39.2.0), and every BSP package
+    depends on ``nvidia-l4t-core`` of exactly its own version. An unpinned
+    install therefore picks the newest plugin package and drags the whole BSP
+    into an upgrade — which fails against the kernel packages the flash holds
+    (``apt-mark hold``) and installs nothing. Pinning to the installed core
+    version installs just the plugin package for the release that is running.
+    Falls back to the bare name when the core package can't be read (a
+    non-dpkg host; the apt call then fails or no-ops on its own).
+    """
+    version = _installed_l4t_core_version()
+    if version is None:
+        return _L4T_GSTREAMER_PACKAGE
+    return f"{_L4T_GSTREAMER_PACKAGE}={version}"
+
+
+def _apt_packages() -> tuple[str, ...]:
+    """Everything ``_apt_install`` installs: the host packages plus NVENC."""
+    return (*_APT_PACKAGES, _l4t_gstreamer_apt_spec())
+
+
 def _apt_install() -> bool:
     apt = shutil.which("apt-get")
     if apt is None:
         _logger.info("apt-get not found; skipping system GStreamer install")
         return False
+    packages = _apt_packages()
     if os.geteuid() != 0:
         # Prime sudo once (a tty prompt when run interactively); the hosted
         # installer runs this as root, so escalation is a no-op there.
@@ -178,11 +243,11 @@ def _apt_install() -> bool:
             _logger.warning(
                 "GStreamer system packages need root; run as root or install "
                 "manually: sudo apt-get install -y %s",
-                " ".join(_APT_PACKAGES),
+                " ".join(packages),
             )
             return False
     run_package_manager([apt, "update"])
-    installed = run_package_manager([apt, "install", "-y", *_APT_PACKAGES])
+    installed = run_package_manager([apt, "install", "-y", *packages])
     if installed.returncode != 0:
         _logger.warning(
             "command failed (apt-get install): %s", failure_detail(installed)
@@ -202,11 +267,11 @@ def _pip_install_pygobject() -> bool:
 
 
 def run(_args: object = None) -> None:
-    """Install the GStreamer framework + introspection typelibs and PyGObject.
+    """Install the GStreamer framework, introspection typelibs, NVENC plugins
+    (``nvidia-l4t-gstreamer``) and PyGObject.
 
-    NVENC (``nvv4l2h264enc`` / ``nvvidconv``) ships with the Jetson L4T BSP and
-    the ``zedxonesrc`` / ``zedsrc`` source elements come from
-    ``axol gst.build-zed``; this command only verifies those are present.
+    The ``zedxonesrc`` / ``zedsrc`` source elements come from
+    ``axol gst.build-zed``; this command only reports whether they are present.
     """
     if not _is_jetson():
         print(

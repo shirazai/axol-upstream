@@ -65,6 +65,10 @@ _APT_BUILD_DEPS = (
     "libhidapi-dev",
     "libudev-dev",
     "libeigen3-dev",
+    # libsurvive's bundled cnkalman does ``find_package(Python ... Development)``
+    # at configure time; a minimal flash (e.g. AGX Thor, L4T 39.2) ships the
+    # interpreter without its headers, so configure fails on Python_INCLUDE_DIRS.
+    "python3-dev",
 )
 
 

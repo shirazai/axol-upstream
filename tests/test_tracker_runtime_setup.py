@@ -61,6 +61,15 @@ def _write_lighthouse_manifest(
     )
 
 
+class LighthouseBuildDependenciesTest(unittest.TestCase):
+    def test_declares_python_headers_for_cnkalman(self) -> None:
+        # libsurvive's bundled cnkalman runs find_package(Python ... Development)
+        # at configure time; a minimal flash (AGX Thor, L4T 39.2) ships the
+        # interpreter without its headers and the build dies on
+        # Python_INCLUDE_DIRS before compiling anything.
+        self.assertIn("python3-dev", tracker_install._APT_BUILD_DEPS)  # noqa: SLF001
+
+
 class LighthouseRuntimeReadinessTest(unittest.TestCase):
     def test_requires_exact_manifest_runtime_and_matching_udev_rule(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

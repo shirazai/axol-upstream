@@ -8,14 +8,17 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from almond_axol.video import gst_zed
+from almond_axol.lerobot import nvenc_encoder
+from almond_axol.video import gst_zed, hw_video
 from almond_axol.video.gst_zed import _split_nals
 from almond_axol.video.hw_video import (
     _bitrate_for,
     _drain_complete_nals,
     _gst_argv,
+    _parse_inspect_properties,
     _strip_start_code,
     dataset_vbr_bitrate,
+    nvenc_maxperf_suffix,
 )
 from almond_axol.video.shm_frames import (
     _RAW_RING_SLOTS,
@@ -43,6 +46,103 @@ def test_gstreamer_command_is_shell_free_and_dimensioned() -> None:
     assert "height=480" in argv
     assert "bitrate=5000000" in argv
     assert "!" in argv
+
+
+# ``gst-inspect-1.0 nvv4l2h264enc`` excerpts: the L4T 36 (Orin / ZED Box)
+# encoder still has maxperf-enable; the L4T 39 (AGX Thor) one replaced it with
+# preset-id / tuning-info-id and only warns about preset-level.
+_ORIN_NVENC_INSPECT = """\
+Element Properties:
+
+  bitrate             : Set bitrate for v4l2 encode
+                        flags: readable, writable, changeable in NULL, READY, PAUSED or PLAYING state
+                        Unsigned Integer. Range: 0 - 4294967295 Default: 4000000
+  maxperf-enable      : Enable or Disable Max Performance mode
+                        flags: readable, writable, changeable only in NULL or READY state
+                        Boolean. Default: false
+  preset-level        : HW preset level for encoder
+                        Enum "GstV4L2VideoEncHwPreset" Default: 1, "UltraFastPreset"
+                           (0): DisablePreset    - Disable HW-Preset
+"""
+
+_THOR_NVENC_INSPECT = """\
+Element Properties:
+
+  bitrate             : Set bitrate for v4l2 encode
+                        flags: readable, writable, changeable in NULL, READY, PAUSED or PLAYING state
+  preset-id           : For each tuning info, seven presets from P1 (highest performance) to P7 (lowest performance)
+                        have been provided to control performance/quality trade off.
+  preset-level        : HW preset level for encoder
+			This will be deprecated in future for Thor. Use the new defined property "preset-id" and "tuning-info-id"
+                        Enum "GstV4L2VideoEncHwPreset" Default: 0, "DisablePreset"
+  tuning-info-id      : Tuning Info Preset for encoder
+                        Enum "GstV4L2VideoEncTuingInfoPreset" Default: 2, "LowLatencyPreset"
+"""
+
+
+@pytest.fixture
+def nvenc_properties(monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
+    """Pretend the installed nvv4l2h264enc reports exactly these properties."""
+
+    def install(names: frozenset[str]) -> None:
+        monkeypatch.setattr(hw_video, "_nvenc_properties", lambda: names)
+        nvenc_maxperf_suffix.cache_clear()
+
+    yield install
+    nvenc_maxperf_suffix.cache_clear()
+
+
+def test_inspect_property_parsing_keeps_names_only() -> None:
+    orin = _parse_inspect_properties(_ORIN_NVENC_INSPECT)
+    assert {"bitrate", "maxperf-enable", "preset-level"} <= orin
+    # Continuation lines (flags, ranges, enum values) are not properties.
+    assert not {"flags", "Boolean", "Unsigned", "Enum", "(0)"} & orin
+
+    thor = _parse_inspect_properties(_THOR_NVENC_INSPECT)
+    assert {"bitrate", "preset-id", "preset-level", "tuning-info-id"} <= thor
+    assert "maxperf-enable" not in thor
+    assert "This" not in thor
+
+
+def test_maxperf_is_only_emitted_when_the_installed_encoder_has_it(
+    nvenc_properties,  # noqa: ANN001
+) -> None:
+    nvenc_properties(_parse_inspect_properties(_ORIN_NVENC_INSPECT))
+    assert nvenc_maxperf_suffix() == " maxperf-enable=true"
+
+    nvenc_properties(_parse_inspect_properties(_THOR_NVENC_INSPECT))
+    assert nvenc_maxperf_suffix() == ""
+
+    # No encoder at all (gst-inspect missing or the element unregistered):
+    # don't guess a property, let the launch fail for the real reason.
+    nvenc_properties(frozenset())
+    assert nvenc_maxperf_suffix() == ""
+
+
+def _every_nvenc_pipeline() -> list[str]:
+    """Each ``nvv4l2h264enc`` description this package builds, as one string."""
+    return [
+        " ".join(_gst_argv(640, 480, 30, 5_000_000)),
+        " ".join(nvenc_encoder._gst_argv(640, 480, 30, "/tmp/out.mp4", nv12=True)),
+        gst_zed._enc_branch(4_000_000, 30, "head"),
+        gst_zed._dataset_enc_shmsink("/tmp/data.sock", 960, 600, 60, "data"),
+    ]
+
+
+def test_every_nvenc_pipeline_follows_the_maxperf_probe(
+    nvenc_properties,  # noqa: ANN001
+) -> None:
+    nvenc_properties(_parse_inspect_properties(_THOR_NVENC_INSPECT))
+    for pipeline in _every_nvenc_pipeline():
+        assert "maxperf" not in pipeline, pipeline
+        # Dropping the property must not leave a dangling token or glue the
+        # neighbouring ones together.
+        assert "idrinterval=30 !" in pipeline or "idrinterval=1 !" in pipeline, pipeline
+
+    nvenc_properties(_parse_inspect_properties(_ORIN_NVENC_INSPECT))
+    for pipeline in _every_nvenc_pipeline():
+        assert " maxperf-enable=true" in pipeline, pipeline
+        assert "maxperf-enable=true !" in pipeline, pipeline
 
 
 def test_annex_b_nal_helpers_handle_three_and_four_byte_prefixes() -> None:

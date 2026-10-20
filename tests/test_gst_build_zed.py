@@ -58,6 +58,89 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
         ):
             install.run()
 
+    def test_gst_install_pins_l4t_gstreamer_to_the_running_bsp(self) -> None:
+        # nvidia-l4t-gstreamer (nvvidconv / nvv4l2h264enc) is missing from a
+        # minimal flash (AGX Thor, L4T 39.2), and NVIDIA's r39.2 repository also
+        # carries 39.2.1: unpinned, apt resolves the newer plugin package, which
+        # drags nvidia-l4t-core and the held kernel into an upgrade that fails.
+        with patch.object(
+            install, "_installed_l4t_core_version", return_value="39.2.0-20260601141651"
+        ):
+            self.assertEqual(
+                install._l4t_gstreamer_apt_spec(),  # noqa: SLF001
+                "nvidia-l4t-gstreamer=39.2.0-20260601141651",
+            )
+        with patch.object(install, "_installed_l4t_core_version", return_value=None):
+            self.assertEqual(
+                install._l4t_gstreamer_apt_spec(),  # noqa: SLF001
+                "nvidia-l4t-gstreamer",
+            )
+
+    def test_installed_l4t_core_version_requires_installed_state(self) -> None:
+        def dpkg(stdout: str, code: int = 0) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], code, stdout, "")
+
+        with (
+            patch.object(install.shutil, "which", return_value="/usr/bin/dpkg-query"),
+            patch.object(
+                install.subprocess,
+                "run",
+                return_value=dpkg("installed 39.2.0-20260601141651"),
+            ),
+        ):
+            self.assertEqual(
+                install._installed_l4t_core_version(),  # noqa: SLF001
+                "39.2.0-20260601141651",
+            )
+        # A removed package whose configuration lingers still answers dpkg-query.
+        with (
+            patch.object(install.shutil, "which", return_value="/usr/bin/dpkg-query"),
+            patch.object(
+                install.subprocess,
+                "run",
+                return_value=dpkg("config-files 36.4.3-20250107174145"),
+            ),
+        ):
+            self.assertIsNone(install._installed_l4t_core_version())  # noqa: SLF001
+        with (
+            patch.object(install.shutil, "which", return_value="/usr/bin/dpkg-query"),
+            patch.object(install.subprocess, "run", return_value=dpkg("", 1)),
+        ):
+            self.assertIsNone(install._installed_l4t_core_version())  # noqa: SLF001
+        with patch.object(install.shutil, "which", return_value=None):
+            self.assertIsNone(install._installed_l4t_core_version())  # noqa: SLF001
+
+    def test_gst_install_apt_installs_host_packages_and_pinned_nvenc(self) -> None:
+        succeeded = subprocess.CompletedProcess([], 0, "", "")
+        run_package_manager = Mock(return_value=succeeded)
+        with (
+            patch.object(install.shutil, "which", return_value="/usr/bin/apt-get"),
+            patch.object(install.os, "geteuid", return_value=0),
+            patch.object(
+                install,
+                "_installed_l4t_core_version",
+                return_value="39.2.0-20260601141651",
+            ),
+            patch.object(install, "run_package_manager", run_package_manager),
+        ):
+            self.assertTrue(install._apt_install())  # noqa: SLF001
+
+        self.assertEqual(
+            run_package_manager.call_args_list,
+            [
+                call(["/usr/bin/apt-get", "update"]),
+                call(
+                    [
+                        "/usr/bin/apt-get",
+                        "install",
+                        "-y",
+                        *install._APT_PACKAGES,  # noqa: SLF001
+                        "nvidia-l4t-gstreamer=39.2.0-20260601141651",
+                    ]
+                ),
+            ],
+        )
+
     def test_declares_zed_sdk_link_dependencies(self) -> None:
         # zed-config.cmake requires BLAS and links the unversioned libusb
         # library. Runtime-only packages do not provide those linker files.

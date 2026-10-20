@@ -37,6 +37,7 @@ import functools
 import logging
 import os
 import queue
+import re
 import select
 import shutil
 import subprocess
@@ -139,8 +140,8 @@ def _gst_argv(width: int, height: int, fps: int, bitrate: int) -> list[str]:
         "video/x-raw(memory:NVMM),format=NV12",
         (
             f"nvv4l2h264enc control-rate=1 bitrate={bitrate} preset-level=1 "
-            f"insert-sps-pps=true insert-aud=true idrinterval={fps} "
-            "maxperf-enable=true"
+            f"insert-sps-pps=true insert-aud=true idrinterval={fps}"
+            f"{nvenc_maxperf_suffix()}"
         ),
         "video/x-h264,stream-format=byte-stream",
         "fdsink fd=1 sync=false",
@@ -149,6 +150,65 @@ def _gst_argv(width: int, height: int, fps: int, bitrate: int) -> list[str]:
     # item; no element string above contains spaces inside a value, so a
     # flat whitespace split yields the right argv (no shell needed).
     return ["gst-launch-1.0", "-q", *" ! ".join(pipeline).split()]
+
+
+# One ``gst-inspect-1.0`` property line: two-space indent, the property name,
+# padding, then the ``:`` before its description.
+_INSPECT_PROPERTY_RE = re.compile(r"^  ([a-z][a-z0-9-]*)\s+:", re.MULTILINE)
+
+_NVENC_MAXPERF_PROPERTY = "maxperf-enable"
+
+
+def _parse_inspect_properties(inspect_output: str) -> frozenset[str]:
+    """Property names listed in ``gst-inspect-1.0 <element>`` output."""
+    return frozenset(_INSPECT_PROPERTY_RE.findall(inspect_output))
+
+
+@functools.cache
+def _nvenc_properties() -> frozenset[str]:
+    """Properties the installed ``nvv4l2h264enc`` exposes (empty if absent)."""
+    inspect = shutil.which("gst-inspect-1.0")
+    if inspect is None:
+        return frozenset()
+    try:
+        proc = subprocess.run(
+            [inspect, "nvv4l2h264enc"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:  # noqa: BLE001 - inspection failure → no known properties
+        return frozenset()
+    if proc.returncode != 0:
+        return frozenset()
+    return _parse_inspect_properties(proc.stdout)
+
+
+@functools.cache
+def nvenc_maxperf_suffix() -> str:
+    """``" maxperf-enable=true"`` when the installed encoder has that property.
+
+    Appended to every ``nvv4l2h264enc`` element description in this package.
+    ``maxperf-enable`` (clock the encoder at its maximum regardless of load)
+    exists on the L4T 35/36 encoder (Orin NX, AGX Orin, ZED Box) but not on
+    L4T 38/39 (AGX Thor), where NVIDIA replaced the performance knobs with
+    ``preset-id`` / ``tuning-info-id`` and the default tuning is already the
+    low-latency one. GStreamer refuses to build a pipeline that names a
+    property its element lacks (``no property "maxperf-enable"``), which took
+    down every camera pipeline on Thor — headset relay, dataset branch and the
+    recorder's mp4 encode alike. So the property is only emitted where the
+    installed element reports it; ``jetson.setup`` pins the NVENC clock on
+    every Jetson regardless.
+
+    Empty when the element itself is missing: the launch then fails for the
+    real reason instead of a misleading property error.
+    """
+    properties = _nvenc_properties()
+    if _NVENC_MAXPERF_PROPERTY in properties:
+        return f" {_NVENC_MAXPERF_PROPERTY}=true"
+    if properties:
+        _logger.info(
+            "nvv4l2h264enc has no %s property (L4T >= 38); encoder pipelines omit it",
+            _NVENC_MAXPERF_PROPERTY,
+        )
+    return ""
 
 
 @functools.cache
